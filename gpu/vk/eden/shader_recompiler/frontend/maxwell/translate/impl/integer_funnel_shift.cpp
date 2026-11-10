@@ -14,15 +14,29 @@ enum class MaxShift : u64 {
     S64,
 };
 
-IR::U64 PackedShift(IR::IREmitter& ir, const IR::U64& packed_int, const IR::U32& safe_shift,
-                    bool right_shift, bool is_signed) {
+IR::U32 FunnelShift32(IR::IREmitter& ir, const IR::U32& lo, const IR::U32& hi,
+                      const IR::U32& shift, bool right_shift, bool is_signed) {
+    const IR::U32 c0{ir.Imm32(0)};
+    const IR::U32 c32{ir.Imm32(32)};
+    const IR::U32 inv_shift{ir.ISub(shift, c32)};
+    const IR::U1 is_long{ir.IGreaterThanEqual(inv_shift, c0, true)};
+    const IR::U1 is_zero{ir.IEqual(shift, c0)};
+    const IR::U32 shift_comp{ir.ISub(c32, shift)};
     if (!right_shift) {
-        return ir.ShiftLeftLogical(packed_int, safe_shift);
+        const IR::U32 shifted_hi{ir.ShiftLeftLogical(hi, shift)};
+        const IR::U32 long_ret_hi{ir.ShiftLeftLogical(lo, inv_shift)};
+        const IR::U32 lo_extract{ir.BitFieldExtract(lo, shift_comp, shift, false)};
+        const IR::U32 short_ret_hi{ir.BitwiseOr(shifted_hi, lo_extract)};
+        const IR::U32 non_zero_hi{ir.Select(is_long, long_ret_hi, short_ret_hi)};
+        return IR::U32{ir.Select(is_zero, hi, non_zero_hi)};
     }
-    if (is_signed) {
-        return ir.ShiftRightArithmetic(packed_int, safe_shift);
-    }
-    return ir.ShiftRightLogical(packed_int, safe_shift);
+    const IR::U32 shifted_lo{ir.ShiftRightLogical(lo, shift)};
+    const IR::U32 long_ret_lo{is_signed ? ir.ShiftRightArithmetic(hi, inv_shift)
+                                        : ir.ShiftRightLogical(hi, inv_shift)};
+    const IR::U32 short_hi_extract{ir.BitFieldExtract(hi, c0, shift, false)};
+    const IR::U32 short_ret_lo{ir.BitFieldInsert(shifted_lo, short_hi_extract, shift_comp, shift)};
+    const IR::U32 non_zero_lo{ir.Select(is_long, long_ret_lo, short_ret_lo)};
+    return IR::U32{ir.Select(is_zero, lo, non_zero_lo)};
 }
 
 void SHF(TranslatorVisitor& v, u64 insn, const IR::U32& shift, const IR::U32& high_bits,
@@ -47,17 +61,13 @@ void SHF(TranslatorVisitor& v, u64 insn, const IR::U32& shift, const IR::U32& hi
         throw NotImplementedException("SHF Use of undefined MaxShift value");
     }
     const IR::U32 low_bits{v.X(shf.lo_bits_reg)};
-    const IR::U64 packed_int{v.ir.PackUint2x32(v.ir.CompositeConstruct(low_bits, high_bits))};
     const IR::U32 max_shift{shf.max_shift == MaxShift::U32 ? v.ir.Imm32(32) : v.ir.Imm32(63)};
     const IR::U32 safe_shift{shf.wrap != 0
                                  ? v.ir.BitwiseAnd(shift, v.ir.ISub(max_shift, v.ir.Imm32(1)))
                                  : v.ir.UMin(shift, max_shift)};
 
     const bool is_signed{shf.max_shift == MaxShift::S64};
-    const IR::U64 shifted_value{PackedShift(v.ir, packed_int, safe_shift, right_shift, is_signed)};
-    const IR::Value unpacked_value{v.ir.UnpackUint2x32(shifted_value)};
-
-    const IR::U32 result{v.ir.CompositeExtract(unpacked_value, right_shift ? 0 : 1)};
+    const IR::U32 result{FunnelShift32(v.ir, low_bits, high_bits, safe_shift, right_shift, is_signed)};
     v.X(shf.dest_reg, result);
 }
 } // Anonymous namespace
