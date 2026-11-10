@@ -28,8 +28,11 @@ void __security_check_cookie(uintptr_t cookie) {
 void __report_rangecheckfailure(void) { __fastfail(8); }   /* FAST_FAIL_RANGE_CHECK_FAILURE */
 
 /* MSVC's stack probe for frames over a page: the same contract on x64 as MinGW's ___chkstk_ms (RAX = the size, every page
-   touched, nothing else changed) */
+   touched, nothing else changed). ARM64 needs none: its __chkstk is the CRT's, and the ARM64 FFmpeg is a MinGW build, so
+   no MSVC-compiled object is linked that would ask for this x64 symbol. */
+#if defined(__x86_64__) || defined(_M_X64)
 __asm__(".text\n.globl __chkstk\n__chkstk:\n    jmp ___chkstk_ms\n");
+#endif
 
 /* the unwind handler of /GS frames: it checks the frame's cookie, then lets the search go on */
 EXCEPTION_DISPOSITION __GSHandlerCheck(PEXCEPTION_RECORD record, void *frame, PCONTEXT context, void *dispatcher) {

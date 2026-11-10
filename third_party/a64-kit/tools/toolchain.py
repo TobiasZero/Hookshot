@@ -13,6 +13,45 @@ def windows():
     return os.name == "nt" or os.environ.get("RX_TARGET", "").lower() == "windows"
 
 
+def arch():
+    """(hookshot) 'arm64' or 'x64': the architecture the game is built for. On Windows it is this PC's, so the game runs
+    natively rather than under x64 emulation; HOOKSHOT_ARCH=x64|arm64 overrides it (a cross build)."""
+    want = os.environ.get("HOOKSHOT_ARCH", "").lower()
+    if want in ("arm64", "aarch64"):
+        return "arm64"
+    if want in ("x64", "x86_64", "amd64"):
+        return "x64"
+    if os.name == "nt":
+        return "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").upper() in ("ARM64", "ARM64EC") else "x64"
+    try:
+        import platform
+        return "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+    except Exception:
+        return "x64"
+
+
+def pe_machine(path):
+    """The machine field of a PE file (0xAA64 ARM64, 0x8664 x64), or 0 when it is not one. The bundled DLLs (SDL2,
+    SDL3, wgpu_native, FFmpeg) are per architecture, and an x64 one cannot be loaded into an ARM64 game."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(0x40)
+            if len(head) < 0x40 or head[:2] != b"MZ":
+                return 0
+            f.seek(int.from_bytes(head[0x3C:0x40], "little"))
+            sig = f.read(6)
+            if len(sig) < 6 or sig[:4] != b"PE\0\0":
+                return 0
+            return int.from_bytes(sig[4:6], "little")
+    except OSError:
+        return 0
+
+
+def wanted_machine():
+    """pe_machine()'s value of a DLL built for the target this build makes."""
+    return 0xAA64 if arch() == "arm64" else 0x8664
+
+
 def mingw(host=False):
     """(hookshot) HOOKSHOT_MINGW=<llvm-mingw folder>: Windows builds with that toolchain's clang, headers and libraries (the GNU ABI
     on the UCRT), as TotK Recomp's installer does: nothing of Visual Studio or the Windows SDK is needed. Empty: the MSVC target.
@@ -53,8 +92,12 @@ def lld_link():
 
 def native_target(host=False):
     if mingw(host):   # (-fms-extensions: __try/__except and __declspec, which clang takes on this target too)
-        return ["--target=x86_64-w64-mingw32", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"]
-    return ["--target=x86_64-pc-windows-msvc", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"] if os.name == "nt" else []
+        triple = "aarch64-w64-mingw32" if arch() == "arm64" else "x86_64-w64-mingw32"
+        return ["--target=" + triple, "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"]
+    if os.name == "nt":
+        triple = "aarch64-pc-windows-msvc" if arch() == "arm64" else "x86_64-pc-windows-msvc"
+        return ["--target=" + triple, "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"]
+    return []
 
 
 def native_link(host=False):

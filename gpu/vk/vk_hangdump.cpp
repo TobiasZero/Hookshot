@@ -34,25 +34,40 @@ struct ThreadStack {
 };
 ThreadStack stacks[kMaxThreads];
 
+/* The thread's program counter and stack pointer, as winnt.h names them on this architecture: Rip/Rsp on x64, Pc/Sp on
+   ARM64 (which also keeps a leaf's return address in Lr, not on the stack). */
+#if defined(_M_ARM64) || defined(__aarch64__)
+#define HDUMP_PC(c) ((c).Pc)
+#define HDUMP_SP(c) ((c).Sp)
+#else
+#define HDUMP_PC(c) ((c).Rip)
+#define HDUMP_SP(c) ((c).Rsp)
+#endif
+
 int unwind(HANDLE h, DWORD64* out) {
     CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_FULL;
     if (!GetThreadContext(h, &ctx)) return 0;
     int n = 0;
-    for (; n < kMaxFrames && ctx.Rip; n++) {
-        out[n] = ctx.Rip;
+    for (; n < kMaxFrames && HDUMP_PC(ctx); n++) {
+        out[n] = HDUMP_PC(ctx);
         DWORD64 image = 0;
-        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
-        if (!f) {   // (a leaf: the return address on the top of the stack)
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(HDUMP_PC(ctx), &image, nullptr);
+        if (!f) {   // (a leaf: the return address on the top of the stack; ARM64 keeps it in the link register)
+#if defined(_M_ARM64) || defined(__aarch64__)
+            if (!ctx.Lr || ctx.Lr == ctx.Pc) break;
+            ctx.Pc = ctx.Lr;
+#else
             if (IsBadReadPtr((void*)ctx.Rsp, 8)) break;
             ctx.Rip = *(DWORD64*)ctx.Rsp;
             ctx.Rsp += 8;
+#endif
         } else {
             void* handler_data = nullptr;
             DWORD64 frame = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &handler_data, &frame, nullptr);
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, HDUMP_PC(ctx), f, &ctx, &handler_data, &frame, nullptr);
         }
-        if (!ctx.Rsp) break;
+        if (!HDUMP_SP(ctx)) break;
     }
     return n;
 }

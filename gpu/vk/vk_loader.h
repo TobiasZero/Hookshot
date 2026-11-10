@@ -82,6 +82,7 @@
     X(vkAllocateMemory)                                                                                               \
     X(vkFreeMemory)                                                                                                   \
     X(vkMapMemory)                                                                                                    \
+    X(vkUnmapMemory)                                                                                                  \
     X(vkBindBufferMemory)                                                                                             \
     X(vkBindImageMemory)                                                                                              \
     X(vkGetBufferMemoryRequirements)                                                                                  \

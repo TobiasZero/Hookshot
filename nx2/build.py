@@ -54,6 +54,9 @@ PGO = os.environ.get("RX_PGO", "")
 # against that root (the AppImage's: glibc 2.35, so the game runs on older systems than the one that built it).
 # HOOKSHOT_VK_PREBUILT=<hookshot_vk.so>: the Vulkan back end as built already (the AppImage's), not compiled here.
 LINUX = not toolchain.windows()   # (hookshot: RX_TARGET=windows on Linux builds the Windows game, with llvm-mingw)
+# (hookshot) a Windows build made on another system: -mtune=native would tune for the build machine's core, not the
+# one the game runs on, so only a native build takes it
+CROSS_BUILD = toolchain.windows() and os.name != "nt"
 POSIX = os.path.join(kit.HERE, "..", "host", "posix")
 SYSROOT = os.environ.get("HOOKSHOT_SYSROOT", "")
 EXE = "hookshot" if LINUX else "hookshot.exe"
@@ -181,6 +184,22 @@ def cache_put(obj, key):
         shutil.copyfile(obj, dst)
 
 
+def copy_beside(src, dst):
+    """Copy a bundled DLL beside the game. One built for the other architecture is refused: an x64 DLL cannot be loaded
+    into an ARM64 game, so the build says so and keeps the fallback (no controllers, no WebGPU renderer) instead of
+    shipping a folder that cannot load it."""
+    import shutil
+    want, got = toolchain.wanted_machine(), toolchain.pe_machine(src)
+    if got and want and got != want:
+        name = lambda m: "ARM64" if m == 0xAA64 else "x64" if m == 0x8664 else hex(m)
+        print("build: %s is built for %s, not %s: not copied (a %s build of it is needed)"
+              % (os.path.basename(src), name(got), name(want), name(want)), flush=True)
+        return False
+    if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+        shutil.copyfile(src, dst)
+    return True
+
+
 class MemoryStatus(ctypes.Structure):   # (Windows' MEMORYSTATUSEX, for GlobalMemoryStatusEx)
     _fields_ = [("len", ctypes.c_uint32), ("load", ctypes.c_uint32)] + \
                [(f, ctypes.c_uint64) for f in ("total", "avail", "pt", "pa", "vt", "va", "ve")]
@@ -209,6 +228,44 @@ def free_mb():
                     return int(line.split()[1]) >> 10
     except (OSError, ValueError, AttributeError):
         return None
+    return None
+
+
+def total_memory_mb():
+    """The physical memory this PC has, in MB (None: not known)"""
+    try:
+        if os.name == "nt":
+            m = MemoryStatus()
+            m.len = ctypes.sizeof(MemoryStatus)
+            return m.total >> 20 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) >> 10
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+# (16 GB, ARM64) The most compilers this build may run at once. -j one per core is fine where there is memory to spare,
+# but a 12-core/16 GB machine (the Surface Pro 11) has ~13 GB usable and each lifted chunk peaks at 2-3.5 GB: four is
+# the most that fits with Windows and a game still open. ARM64 is capped too, because its memory is one pool shared with
+# the GPU (UMA) rather than a separate VRAM allotment. HOOKSHOT_MAX_JOBS overrides; --jobs is clamped to it.
+JOB_CAP_SMALL_MEMORY = 4
+SMALL_MEMORY_MB = 20 * 1024
+
+
+def job_cap():
+    """The compiler count this machine's memory holds, or None when it is not the limit (a big x86 PC)"""
+    want = os.environ.get("HOOKSHOT_MAX_JOBS")
+    if want:
+        try:
+            return max(1, int(want))
+        except ValueError:
+            pass
+    total = total_memory_mb()
+    if ARCH == "arm64" or (total is not None and total <= SMALL_MEMORY_MB):
+        return JOB_CAP_SMALL_MEMORY
     return None
 
 
@@ -312,10 +369,20 @@ class MemoryGate:
 GATE = None   # (main's MemoryGate; None: compiles start as the jobs allow)
 
 
-FFMPEG = next((os.path.join(d, n) for d in [os.path.join(r, "ffmpeg") for r in cpm_dirs()] if os.path.isdir(d)
-               for n in sorted(os.listdir(d)) if os.path.isdir(os.path.join(d, n, "lib"))
-               and "linux" not in n.lower()), None)   # (hookshot: a cache with both systems' builds, cross-building)
+FFMPEG = os.environ.get("HOOKSHOT_FFMPEG") or next(
+    (os.path.join(d, n) for d in [os.path.join(r, "ffmpeg") for r in cpm_dirs()] if os.path.isdir(d)
+     for n in sorted(os.listdir(d)) if os.path.isdir(os.path.join(d, n, "lib"))
+     and "linux" not in n.lower()), None)   # (hookshot: a cache with both systems' builds, cross-building)
 FFMPEG_LIBS = ("avcodec", "swscale", "swresample", "avutil")
+# (hookshot, Windows ARM64: HOOKSHOT_FFMPEG=<prefix> names an FFmpeg the CPM cache does not have — MSYS2's clangarm64,
+# for one. Its MinGW import libraries are linked with -L/-l, not the MSVC .lib paths the CPM package uses)
+FFMPEG_MSVC = bool(FFMPEG and os.path.exists(os.path.join(FFMPEG, "lib", "avcodec.lib")))
+# (MinGW prefixes ship both libX.a (static, every codec's dependencies) and libX.dll.a. The import libraries are what
+# the build wants: -static is on for the C++ runtime, and naming the .dll.a files keeps the codec DLLs out of it)
+FFMPEG_LINK = [] if not FFMPEG else (
+    [os.path.join(FFMPEG, "lib", l + ".lib") for l in FFMPEG_LIBS] if FFMPEG_MSVC else
+    [os.path.join(FFMPEG, "lib", "lib" + l + ".dll.a")
+     if os.path.exists(os.path.join(FFMPEG, "lib", "lib" + l + ".dll.a")) else "-l" + l for l in FFMPEG_LIBS])
 
 
 def ffmpeg_linux():
@@ -365,24 +432,31 @@ def ffmpeg_version_key():
 # four: the race's replay waited ~12 ms a frame for it). RX_SOFT_WRITE_WATCH=0: Windows' write watch (a full rebuild)
 WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WRITE_TRACK"]
 
-# (hookshot) the host CPU the lifted game and the runtime are built for: x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT,
+# (hookshot) the host CPU the lifted game and the runtime are built for. On x86-64: x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT,
 # MOVBE; Haswell and Zen 1 on). With FMA the FPX1 fast paths cover double-precision FMA (RECOMP_FPX_FMA64; it took
 # the exact software body on baseline x86-64) and the bit counts are single instructions. No contraction, so a C
 # expression is rounded as written (the exact bodies and FPX1's proofs assume it). RX_MARCH=x86-64: the old baseline
 # (issue 363: a Xeon E5-2667 v2 (Ivy Bridge, no AVX2) built the game and then stopped at its first AVX2 instruction,
 # 0xc000001d. The game is built on the PC it runs on: a CPU without x86-64-v3's features gets x86-64-v2, or x86-64)
-from host_cpu import host_march   # (make_game.py asks it too: the AppImage's renderer)
+# On ARM64 (Windows on Snapdragon, Linux on aarch64) the build is native for the same reason, with the guest's own
+# ARMv8.2 extensions: -mcx16 is x86-only (clang rejects it for aarch64), so it stays on the x86 side.
+from host_cpu import host_arch, host_march   # (make_game.py asks it too: the AppImage's renderer)
 
+ARCH = host_arch()
 MARCH = os.environ.get("RX_MARCH") or host_march()
-if MARCH != "x86-64-v3":
-    print("build: this CPU has no AVX2: the game is built for %s (a little slower)" % MARCH, flush=True)
-CPU = ["-march=" + MARCH, "-ffp-contract=off"]
+if ARCH == "arm64":
+    # (-mtune=native tunes for the core that builds it; a cross build has another machine's core)
+    CPU = ["-march=" + MARCH, "-ffp-contract=off"] + ([] if CROSS_BUILD else ["-mtune=native"])
+else:
+    CPU = ["-march=" + MARCH, "-mcx16", "-ffp-contract=off"]
+    if MARCH != "x86-64-v3":
+        print("build: this CPU has no AVX2: the game is built for %s (a little slower)" % MARCH, flush=True)
 
 
 def flags(gen, rt64, opt, polls):
     return target() + CPU + [
         "-I" + rt64, "-I" + gen, "-I" + os.path.join(kit.KIT, "rt"), "-I" + NX2_RT, "-Wno-everything",
-        "-fno-strict-aliasing", "-mcx16", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
+        "-fno-strict-aliasing", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
         "-ffunction-sections", "-mllvm", "-capture-tracking-max-uses-to-explore=5000"] + \
         (["-DA64_POLLING"] if polls else []) + WRITE_TRACK
 
@@ -572,6 +646,11 @@ def main():
     p.add_argument("--lib", action="store_true")
     p.add_argument("--standalone", action="store_true")
     a = p.parse_args()
+    cap = job_cap()
+    if cap and a.jobs > cap:
+        print("build: %d compilers at once at most on this machine (asked for %d): the memory is shared with the GPU; "
+              "HOOKSHOT_MAX_JOBS=<n> to change" % (cap, a.jobs), flush=True)
+        a.jobs = cap
     sa = os.path.join(kit.WORK, "sa")
     gen = os.path.join(sa if a.standalone else kit.WORK, "gen")
     out = os.path.join(sa if a.standalone else kit.WORK, "build")
@@ -646,7 +725,7 @@ def main():
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     if LINUX:
@@ -824,7 +903,7 @@ def main():
                            ([os.path.join(kit.WORK, "hookshot.res")] if os.path.exists(os.path.join(kit.WORK, "hookshot.res")) else []) +   # (nx2/make_icon.py)
                            ([toolchain.link_opt("/subsystem:windows"), toolchain.link_opt("/entry:mainCRTStartup")] if os.environ.get("RX_RELEASE") == "1" else []) +   # (no console window)
                            ([os.path.join(WGPU, "lib", "wgpu_native.dll.lib")] if wgpu else []) +
-                           ([os.path.join(FFMPEG, "lib", l + ".lib") for l in ("avcodec", "swscale", "swresample", "avutil")] +
+                           (FFMPEG_LINK +
                             ["-lbcrypt", "-lmfplat", "-lmfuuid", "-lstrmiids", "-lole32"] if FFMPEG else []) +
                            (["-lc++", "-lunwind"] if toolchain.mingw() else []),   # (llvm-mingw: the C++ parts' runtime, linked in; MSVC's comes by itself)
                            capture_output=True, text=True)
@@ -835,29 +914,23 @@ def main():
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
         if wgpu:   # (wgpu_native.dll beside it; in use while the game runs)
-            import shutil
-            dll, dst = os.path.join(WGPU, "lib", "wgpu_native.dll"), os.path.join(out, "wgpu_native.dll")
-            if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(dll):
-                shutil.copyfile(dll, dst)
+            copy_beside(os.path.join(WGPU, "lib", "wgpu_native.dll"), os.path.join(out, "wgpu_native.dll"))
         # (hookshot) a shared FFmpeg's DLLs beside it (an LGPL shared build, as cross builds find: the static one needs none)
         for l in FFMPEG_LIBS if FFMPEG and os.path.isdir(os.path.join(FFMPEG, "bin")) else ():
-            import shutil
             for f in os.listdir(os.path.join(FFMPEG, "bin")):
                 if f.startswith(l + "-") and f.endswith(".dll"):
-                    shutil.copyfile(os.path.join(FFMPEG, "bin", f), os.path.join(out, f))
+                    copy_beside(os.path.join(FFMPEG, "bin", f), os.path.join(out, f))
         # (hookshot) SDL2.dll beside it: host/pad_sdl.c's controllers (DualSense, DualShock 4, Switch Pro ...)
         sdl = os.path.join(kit.HERE, "..", "third_party", "sdl2", "SDL2.dll")
         sdl_dst = os.path.join(out, "SDL2.dll")
-        if os.path.exists(sdl) and (not os.path.exists(sdl_dst) or os.path.getsize(sdl_dst) != os.path.getsize(sdl)):
-            import shutil
-            shutil.copyfile(sdl, sdl_dst)
+        if os.path.exists(sdl):
+            copy_beside(sdl, sdl_dst)
         # (SDL2.dll is sdl2-compat: the SDL2 calls on SDL3, whose controller support is current (a Steam Controller user's
         # report). It loads SDL3.dll from beside it)
         sdl3 = os.path.join(kit.HERE, "..", "third_party", "sdl2", "SDL3.dll")
         sdl3_dst = os.path.join(out, "SDL3.dll")
-        if os.path.exists(sdl3) and (not os.path.exists(sdl3_dst) or os.path.getsize(sdl3_dst) != os.path.getsize(sdl3)):
-            import shutil
-            shutil.copyfile(sdl3, sdl3_dst)
+        if os.path.exists(sdl3):
+            copy_beside(sdl3, sdl3_dst)
     if vk_prebuilt and a.standalone and not a.only:
         import shutil
         shutil.copyfile(vk_prebuilt, os.path.join(out, VK_LIB))

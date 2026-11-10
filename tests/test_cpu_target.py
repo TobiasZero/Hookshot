@@ -43,7 +43,8 @@ def march_on_linux(text):
         if path == "/proc/cpuinfo":
             return io.StringIO(text)
         return real_open(path, *args, **kwargs)
-    with mock.patch.object(host_cpu.os, "name", "posix"), mock.patch.object(builtins, "open", fake_open):
+    with mock.patch.object(host_cpu.os, "name", "posix"), mock.patch.dict(os.environ, {"HOOKSHOT_ARCH": "x64"}), \
+            mock.patch.object(builtins, "open", fake_open):
         return host_cpu.host_march()
 
 
@@ -63,13 +64,31 @@ class HostMarch(unittest.TestCase):
         for present, want in (({38, 40}, "x86-64-v3"), ({38}, "x86-64-v2"), (set(), "x86-64")):
             ctypes = mock.MagicMock()
             ctypes.windll.kernel32 = K32(present)
-            with mock.patch.object(host_cpu.os, "name", "nt"), mock.patch.dict(sys.modules, {"ctypes": ctypes}):
+            with mock.patch.object(host_cpu.os, "name", "nt"), mock.patch.dict(os.environ, {"HOOKSHOT_ARCH": "x64"}), \
+                    mock.patch.dict(sys.modules, {"ctypes": ctypes}):
                 self.assertEqual(host_cpu.host_march(), want, present)
+
+    def test_arm64_is_native_not_emulated(self):
+        # (the Surface Pro 11: PROCESSOR_ARCHITECTURE is ARM64, and the game is built for it rather than for x64 under
+        # emulation. RX_MARCH still overrides build.py's -march)
+        with mock.patch.object(host_cpu.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"PROCESSOR_ARCHITECTURE": "ARM64", "HOOKSHOT_ARCH": ""}, clear=False):
+            self.assertEqual(host_cpu.host_arch(), "arm64")
+            self.assertEqual(host_cpu.host_march(), host_cpu.ARM64_MARCH)
+        self.assertIn("armv8.2-a", host_cpu.ARM64_MARCH)
+        self.assertIn("+dotprod", host_cpu.ARM64_MARCH)
+
+    def test_x64_windows_reports_x64(self):
+        with mock.patch.object(host_cpu.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"PROCESSOR_ARCHITECTURE": "AMD64", "HOOKSHOT_ARCH": ""}, clear=False):
+            self.assertEqual(host_cpu.host_arch(), "x64")
 
     def test_build_and_appimage_use_it(self):
         build = (ROOT / "nx2" / "build.py").read_text(encoding="utf-8")
-        self.assertIn("from host_cpu import host_march", build)
+        self.assertIn("from host_cpu import host_arch, host_march", build)
         self.assertIn('MARCH = os.environ.get("RX_MARCH") or host_march()', build)
+        # (-mcx16 is x86-only: clang rejects it for aarch64, so it is added on the x64 side only)
+        self.assertIn('ARCH == "arm64"', build)
         appimage = (ROOT / "scripts" / "linux" / "appimage.sh").read_text(encoding="utf-8")
         self.assertIn("RX_MARCH=x86-64-v3 RX_VK_ONLY=1", appimage)   # (its prebuilt renderer: not the CI runner's CPU)
 

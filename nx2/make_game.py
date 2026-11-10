@@ -297,16 +297,20 @@ def check(a, work):
 
 
 def visual_studio_environment():
-    """What Visual Studio's own vcvars64.bat sets, for a compiler that does not find it by itself; None without one"""
+    """What Visual Studio's own vcvars64.bat sets, for a compiler that does not find it by itself; None without one.
+    On ARM64 the ARM64 tools and vcvarsarm64.bat are the ones the game is built with."""
+    arm = target_arch() == "arm64"
+    component = "Microsoft.VisualStudio.Component.VC.Tools.ARM64" if arm else "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    bat_name = "vcvarsarm64.bat" if arm else "vcvars64.bat"
     vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"), "Microsoft Visual Studio", "Installer", "vswhere.exe")
     if not os.path.exists(vswhere):
         return None
-    r = subprocess.run([vswhere, "-latest", "-prerelease", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+    r = subprocess.run([vswhere, "-latest", "-prerelease", "-products", "*", "-requires", component,
                         "-property", "installationPath"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     lines = r.stdout.strip().splitlines()
     if not lines:
         return None
-    bat = os.path.join(lines[-1], "VC", "Auxiliary", "Build", "vcvars64.bat")
+    bat = os.path.join(lines[-1], "VC", "Auxiliary", "Build", bat_name)
     if not os.path.exists(bat):
         return None
     r = subprocess.run('"%s" >nul && set' % bat, shell=True, capture_output=True, text=True, encoding="mbcs", errors="replace")
@@ -335,8 +339,9 @@ def windows_kits_environment(base):
     v = versions[-1]
     env = dict(base or {})
     get = lambda k: next((env[n] for n in env if n.upper() == k), os.environ.get(k, ""))
+    lib_arch = "arm64" if target_arch() == "arm64" else "x64"
     env["INCLUDE"] = ";".join(x for x in [get("INCLUDE")] + [os.path.join(inc, v, d) for d in ("ucrt", "um", "shared", "winrt")] if x)
-    env["LIB"] = ";".join(x for x in [get("LIB")] + [os.path.join(kits, "Lib", v, d, "x64") for d in ("ucrt", "um")] if x)
+    env["LIB"] = ";".join(x for x in [get("LIB")] + [os.path.join(kits, "Lib", v, d, lib_arch) for d in ("ucrt", "um")] if x)
     print("the Windows SDK %s from %s" % (v, kits), flush=True)
     return env
 
@@ -425,12 +430,68 @@ def requested_jobs(value):
     return jobs or None
 
 
+def total_memory_mb():
+    """The physical memory this PC has, in MB (None: not known)"""
+    try:
+        if os.name == "nt":
+            import ctypes
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong)] + \
+                           [(f, ctypes.c_ulonglong) for f in ("total", "avail", "page", "avail_page", "virt",
+                                                             "avail_virt", "avail_ext")]
+            m = MemoryStatus()
+            m.len = ctypes.sizeof(m)
+            return m.total >> 20 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) >> 10
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+# (16 GB, ARM64) The most compilers that fit: each lifted chunk peaks at 2-3.5 GB, and Windows needs ~3.5 GB of the 16.
+# One a core is right where memory is not the limit; four is the most on a 16 GB machine, and on ARM64 at all, because
+# the RAM is one pool shared with the GPU (UMA) rather than a separate VRAM allotment. HOOKSHOT_MAX_JOBS or
+# HOOKSHOT_JOBS override it.
+MAX_COMPILERS_SMALL_MEMORY = 4
+SMALL_MEMORY_MB = 20 * 1024
+
+
+def target_arch():
+    """The architecture this build makes: this PC's, or HOOKSHOT_ARCH's (nx2/host_cpu.py)"""
+    from host_cpu import host_arch
+    return host_arch()
+
+
+def max_compilers(cpus):
+    """The compilers this PC should run at once (see MAX_COMPILERS_SMALL_MEMORY)"""
+    want = os.environ.get("HOOKSHOT_MAX_JOBS")
+    if want:
+        try:
+            return max(1, min(cpus, int(want)))
+        except ValueError:
+            pass
+    total = total_memory_mb()
+    if target_arch() == "arm64" or (total is not None and total <= SMALL_MEMORY_MB):
+        return min(cpus, MAX_COMPILERS_SMALL_MEMORY)
+    return cpus
+
+
 def default_jobs():
     """(issue 418) One compiler per CPU thread: nx2/build.py starts each one only when the memory free holds it (MemoryGate), so the
-    count no longer has to fit the biggest files in the memory free at the start. HOOKSHOT_JOBS or --jobs choose"""
+    count no longer has to fit the biggest files in the memory free at the start. Short of memory (16 GB) or on ARM64 the count is
+    capped at four (MAX_COMPILERS_SMALL_MEMORY). HOOKSHOT_JOBS, HOOKSHOT_MAX_JOBS or --jobs choose"""
     cpus = os.cpu_count() or 2
-    print("build: up to %d compilers at once (one per CPU thread), as the memory allows; HOOKSHOT_JOBS=<n> to change" % cpus, flush=True)
-    return cpus
+    jobs = max_compilers(cpus)
+    if jobs < cpus:
+        print("build: up to %d compilers at once (%d cores, %d GB of memory shared with the GPU); HOOKSHOT_JOBS=<n> to change"
+              % (jobs, cpus, (total_memory_mb() or 0) // 1024), flush=True)
+    else:
+        print("build: up to %d compilers at once (one per CPU thread), as the memory allows; HOOKSHOT_JOBS=<n> to change" % jobs,
+              flush=True)
+    return jobs
 
 
 def chosen_jobs(given):
@@ -547,7 +608,7 @@ def check_windows_sdk():
              "Windows 11 SDK, then build again. (%s)" % why)
     if "file not found" in why:
         fail("Visual Studio's C++ tools were not found. In the Visual Studio Installer choose Modify, tick \"Desktop development with C++\" "
-             "and its MSVC x64/x86 build tools, then build again. (%s)" % why)
+             "and its MSVC %s build tools, then build again. (%s)" % ("ARM64" if target_arch() == "arm64" else "x64/x86", why))
     fail("The compiler could not run a test build: %s" % why)
 
 

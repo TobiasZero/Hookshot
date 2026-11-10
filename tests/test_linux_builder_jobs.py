@@ -156,9 +156,11 @@ class BuilderBuildJobsTests(unittest.TestCase):
 class MakeGameJobsTests(unittest.TestCase):
     """make_game's own choice, which the Linux window now leaves to it (issue 531)"""
 
-    def choose(self, cpus, os_name):
+    def choose(self, cpus, os_name, arch="x64", total_mb=32 * 1024):
         with mock.patch.object(make_game.os, "cpu_count", return_value=cpus), \
                 mock.patch.object(make_game.os, "name", os_name), \
+                mock.patch.object(make_game, "target_arch", return_value=arch), \
+                mock.patch.object(make_game, "total_memory_mb", return_value=total_mb), \
                 contextlib.redirect_stdout(io.StringIO()):
             return make_game.default_jobs()
 
@@ -168,6 +170,15 @@ class MakeGameJobsTests(unittest.TestCase):
         self.assertEqual(self.choose(16, "posix"), 16)
         self.assertEqual(self.choose(16, "nt"), 16)
         self.assertEqual(self.choose(32, "posix"), 32)
+
+    def test_short_memory_and_arm64_cap_the_compilers(self):
+        # (16 GB, one pool shared with the GPU: four compilers at most, whatever the core count. A 12-core X1E80100
+        # asking for 12 is the 16 GB out-of-memory case this cap exists for)
+        self.assertEqual(self.choose(12, "nt", arch="arm64", total_mb=15 * 1024), 4)
+        self.assertEqual(self.choose(12, "nt", arch="x64", total_mb=15 * 1024), 4)
+        self.assertEqual(self.choose(12, "nt", arch="arm64", total_mb=64 * 1024), 4)
+        self.assertEqual(self.choose(8, "posix", arch="x64", total_mb=64 * 1024), 8)
+        self.assertEqual(self.choose(4, "nt", arch="arm64", total_mb=15 * 1024), 4)
 
     def test_the_gate_floor_is_windows_only(self):
         # (Windows pages rather than fails; Linux stops a compiler that does not fit)

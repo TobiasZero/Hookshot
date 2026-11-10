@@ -109,8 +109,8 @@ static void release_locked(uint64_t mutex) {
     hos_thread_wake(w.t);
 }
 
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
-#include <emmintrin.h>
+#if !defined(__EMSCRIPTEN__)
+#include "hos_cpu.h"
 static int spin_for_release(uint64_t mutex, uint32_t held) {
     static int64_t limit = -1;
     if (limit < 0) {
@@ -128,7 +128,7 @@ static int spin_for_release(uint64_t mutex, uint32_t held) {
                 __atomic_store_n(&misses[slot], 0, __ATOMIC_RELAXED);
                 return 1;
             }
-            _mm_pause();
+            HOS_CPU_RELAX();
         }
         if (hos_now_ns() >= end) {
             if (m < 4) __atomic_store_n(&misses[slot], m + 1, __ATOMIC_RELAXED);
