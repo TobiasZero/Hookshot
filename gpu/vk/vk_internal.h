@@ -19,6 +19,17 @@
 #include <x86intrin.h>
 #define HOOKSHOT_RDTSC() ((uint64_t)__rdtsc())
 #define HOOKSHOT_PAUSE() _mm_pause()
+#elif defined(_M_ARM64) || defined(__aarch64__)
+/* (Windows on ARM: no __rdtsc. clang's builtin reads Arm's generic counter (cntvct_el0), which is what the frame
+   timing needs; YIELD is the spin-loop hint PAUSE provides on x86) */
+#if defined(__clang__) || defined(__GNUC__)
+#define HOOKSHOT_RDTSC() ((uint64_t)__builtin_readcyclecounter())
+#define HOOKSHOT_PAUSE() __asm__ __volatile__("yield")
+#else
+#include <intrin.h>
+#define HOOKSHOT_RDTSC() ((uint64_t)__rdpmccntr64())
+#define HOOKSHOT_PAUSE() __yield()
+#endif
 #endif
 
 typedef struct VmaAllocation_T* VmaAllocation;   // (vk_mem_alloc.h's handle)
@@ -26,6 +37,11 @@ typedef struct VmaAllocation_T* VmaAllocation;   // (vk_mem_alloc.h's handle)
 namespace mkwvk {
 
 extern std::vector<std::string> gpu_device_names;
+/// (hookshot) The device has no VK_EXT_mesh_shader, so task and mesh programs are to run as a compute dispatch that
+/// appends vertices and primitives to a ring buffer, followed by the pass-through vertex shader and an indirect draw
+/// (docs/arm64-phase3.md). Set when the device is created; RX_VK_EMULATE_MESH=0 turns it off (the mesh draws are then
+/// left out, as before).
+extern bool g_vk_emulate_mesh_shader;
 extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)

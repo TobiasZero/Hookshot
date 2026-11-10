@@ -1,6 +1,6 @@
 // The renderer's core: the WebGPU device and the window's surface, batches (one command encoder and its upload
 // memory per GPU submission), render targets, clears, the 3D engine's draw methods (suyu's DrawManager), present.
-#include <intrin.h>
+#include "rx_cpu.h"
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -1346,13 +1346,13 @@ int64_t clock_ns() {
     if (!stats_on) return 0;
     static const double ns_per_tick = [] {
         const int64_t t0 = hos_now_ns();
-        const uint64_t c0 = __rdtsc();
+        const uint64_t c0 = RX_RDTSC();
         Sleep(20);
         const int64_t t1 = hos_now_ns();
-        const uint64_t c1 = __rdtsc();
+        const uint64_t c1 = RX_RDTSC();
         return c1 > c0 ? double(t1 - t0) / double(c1 - c0) : 0.0;
     }();
-    return (int64_t)(double(__rdtsc()) * ns_per_tick);
+    return (int64_t)(double(RX_RDTSC()) * ns_per_tick);
 }
 
 bool gpu_read(uint64_t va, void* dst, uint64_t n) {

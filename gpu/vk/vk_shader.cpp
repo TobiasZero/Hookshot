@@ -48,6 +48,7 @@
 #include "shader_recompiler/runtime_info.h"
 
 #include "vk_paths.h"
+#include "mesh_passthrough_vs.h"
 #include "vk_internal.h"
 #include "vk_jobs.h"
 #include "vk_draw.h"
@@ -66,6 +67,9 @@ extern thread_local uint32_t g_nvn2_compute_ssbo_count;
 extern thread_local uint32_t g_nvn2_compute_layout_end;
 extern thread_local bool g_nvn2_miss_log_this;
 extern thread_local bool g_all_global_this;
+}
+namespace Shader::Backend::SPIRV {
+extern thread_local bool g_mesh_emu;
 }
 namespace mkwvk {
 struct NvnState;
@@ -546,6 +550,79 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     VkShaderModule m = VK_NULL_HANDLE;
     vkCreateShaderModule(dev.device, &ci, nullptr, &m);
     return m;
+}
+
+// (hookshot, experiment) RX_SPV_OPT=<spirv-opt.exe>: the Adreno compiler rejects the emulated mesh module (127.000+
+// words, every epilogue iteration unrolled); run it through spirv-opt -O before the driver sees it.
+std::vector<uint32_t> spv_optimize(const std::vector<uint32_t>& in) {
+    static const char* exe = getenv("RX_SPV_OPT");
+    if (!exe) {
+        return in;
+    }
+    char dir[MAX_PATH]{};
+    GetTempPathA(sizeof dir, dir);
+    static std::atomic<unsigned> serial{0};
+    char in_path[MAX_PATH]{}, out_path[MAX_PATH]{};
+    snprintf(in_path, sizeof in_path, "%shookshot_spv_%lu_%u.spv", dir,
+             (unsigned long)GetCurrentProcessId(), serial++);
+    snprintf(out_path, sizeof out_path, "%s.out.spv", in_path);
+    FILE* f = fopen(in_path, "wb");
+    if (!f) {
+        return in;
+    }
+    fwrite(in.data(), sizeof(uint32_t), in.size(), f);
+    fclose(f);
+    char cmd[3 * MAX_PATH + 64];
+    snprintf(cmd, sizeof cmd, "\"%s\" -O \"%s\" -o \"%s\"", exe, in_path, out_path);
+    int rc = -1;
+#ifdef _WIN32
+    std::string exe_str(exe);
+    const size_t slash = exe_str.find_last_of("\\/");
+    if (slash != std::string::npos) {
+        const std::string exe_dir = exe_str.substr(0, slash);
+        SetDllDirectoryA(exe_dir.c_str());
+    } else {
+        SetDllDirectoryA("C:\\msys64\\clangarm64\\bin");
+    }
+    STARTUPINFOA si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessA(exe, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exit_code = 1;
+        if (GetExitCodeProcess(pi.hProcess, &exit_code)) {
+            rc = (int)exit_code;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+#else
+    rc = system(cmd);
+#endif
+    std::vector<uint32_t> out;
+    if (rc == 0) {
+        FILE* g = fopen(out_path, "rb");
+        if (g) {
+            fseek(g, 0, SEEK_END);
+            const long size = ftell(g);
+            fseek(g, 0, SEEK_SET);
+            if (size > 20) {
+                out.resize((size_t)size / sizeof(uint32_t));
+                if (fread(out.data(), sizeof(uint32_t), out.size(), g) != out.size()) {
+                    out.clear();
+                }
+            }
+            fclose(g);
+        }
+    }
+    remove(in_path);
+    remove(out_path);
+    if (out.empty()) {
+        logf("vk: spirv-opt failed (%d); the module goes to the driver as emitted", rc);
+        return in;
+    }
+    logf("vk: spirv-opt: %zu -> %zu words", in.size(), out.size());
+    return out;
 }
 
 } // namespace
@@ -1328,6 +1405,118 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         Shader::Optimization::g_nvn2_miss_log_this = !only || !strncmp(hex, only, strlen(only));
     }
     try {
+        if (g_vk_emulate_mesh_shader && getenv("RX_VK_MESH_EMU_DRAW")) {
+            // (hookshot) no VK_EXT_mesh_shader: the mesh stage is translated as a compute module that writes the emulation
+            // ring, and the draw uses the pass-through vertex shader (docs/arm64-phase3.md). A task stage runs as its own
+            // compute dispatch and leaves the mesh workgroup count in the region.
+            struct MeshEmuGuard {
+                MeshEmuGuard() { Shader::Backend::SPIRV::g_mesh_emu = true; }
+                ~MeshEmuGuard() { Shader::Backend::SPIRV::g_mesh_emu = false; }
+            } emu_guard;
+            Shader::Backend::Bindings emu_bindings{};
+            std::vector<std::vector<uint32_t>> emu_kept;
+            const std::array<u32, 3> mesh_regs = mesh_registers_of(task, mesh);
+            std::unique_ptr<Translation> task_t;
+            if (task) {
+                Env tenv{s, *task, Shader::Stage::Task};
+                tenv.set_mesh(mesh_regs, nullptr);
+                task_t = translate(tenv, true, true);
+                dump_ir(p, "task", task_t->program, task->key);
+                Shader::RuntimeInfo trt{};
+                trt.previous_stage_stores.mask.set();
+                const std::vector<uint32_t> tspirv =
+                    Shader::Backend::SPIRV::EmitSPIRV(profile(), trt, task_t->program, emu_bindings);
+                emu_kept.push_back(tspirv);
+                p.mesh_task_module = make_module(tspirv);
+                Stage tst;
+                tst.nvn_stage = bank_stage(*task);
+                tst.info = task_t->program.info;
+                tst.module = p.mesh_task_module;
+                tst.vk_stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                tst.c1 = task->c1;
+                p.stages.push_back(std::move(tst));
+            }
+            Env menv{s, mesh, Shader::Stage::Mesh};
+            menv.set_mesh(mesh_regs, prim ? prim->sph : nullptr);
+            auto mesh_t = translate(menv, true, true);
+            dump_ir(p, "mesh", mesh_t->program, mesh.key);
+            Shader::RuntimeInfo mrt{};
+            if (task_t) mrt.previous_stage_stores = task_t->program.info.stores;
+            else mrt.previous_stage_stores.mask.set();
+            mrt.convert_depth_mode = host->depth_minus_w() != 0;
+            const std::vector<uint32_t> mspirv =
+                Shader::Backend::SPIRV::EmitSPIRV(profile(), mrt, mesh_t->program, emu_bindings);
+            Shader::Backend::SPIRV::g_mesh_emu = false;
+            emu_kept.push_back(mspirv);
+            p.emulated_mesh = true;
+            p.mesh = true;   // (no vertex input: the pass-through vertex shader reads the ring)
+            p.mesh_compute_module = make_module(spv_optimize(mspirv));
+            p.mesh_max_vertices = mesh_t->program.mesh.max_vertices;
+            p.mesh_max_primitives = mesh_t->program.mesh.max_primitives;
+            p.mesh_corners = mesh_t->program.mesh.Corners();
+            {
+                Stage mst;
+                mst.nvn_stage = bank_stage(mesh);
+                mst.info = mesh_t->program.info;
+                mst.module = p.mesh_compute_module;
+                mst.vk_stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                mst.c1 = mesh.c1;
+                p.stages.push_back(std::move(mst));
+            }
+            {   // the draw's vertex stage: one position a vertex record
+                Stage vs;
+                vs.nvn_stage = 0;
+                vs.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
+                vs.module = make_module(mesh_passthrough_vs());
+                p.stages.push_back(std::move(vs));
+            }
+            if (fsc) {
+                Env fenv{s, *fsc, Shader::Stage::Fragment};
+                auto fs = translate(fenv, true);
+                Shader::RuntimeInfo frt{};
+                frt.previous_stage_stores = mesh_t->program.info.stores;
+                if (mesh_t->program.mesh.topology == 0) {
+                    for (size_t i = 0; i < Shader::IR::NUM_GENERICS; i++) {
+                        if (fs->program.info.loads.Generic(i) && !mesh_t->program.info.stores.Generic(i)) {
+                            frt.point_coord_generics.set(i);
+                        }
+                    }
+                }
+                for (int i = 0; i < 8; i++) {
+                    frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
+                }
+                const std::vector<uint32_t> fspirv =
+                    Shader::Backend::SPIRV::EmitSPIRV(profile(), frt, fs->program, emu_bindings);
+                emu_kept.push_back(fspirv);
+                Stage f;
+                f.nvn_stage = 1;
+                f.info = fs->program.info;
+                f.module = make_module(fspirv);
+                f.vk_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+                f.c1 = fsc->c1;
+                p.stages.push_back(std::move(f));
+            }
+            for (const Stage& st : p.stages) {
+                if (!st.module) {
+                    throw Shader::LogicError("vkCreateShaderModule failed");
+                }
+            }
+            if (!p.mesh_compute_module || (task && !p.mesh_task_module))
+                throw Shader::LogicError("mesh emulation compute module creation failed");
+            record_answers(p, s);
+            ptr_diag_log(p.key, "mesh (emulated)");
+            // The current cache only serializes p.stages (VS/FS); emu_kept contains
+            // task/mesh/FS and cannot be paired with those stages. Keep this variant
+            // in memory until the cache format stores compute modules and metadata.
+            logf("vk: mesh program %016llx emulated: %u vertices, %u primitives a workgroup",
+                 (unsigned long long)p.key, p.mesh_max_vertices, p.mesh_max_primitives);
+            st_translated++;
+            st_translate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            // Publish last, just as the common tail below does for native stages.
+            p.ready.store(true, std::memory_order_release);
+            return;
+        }
         Shader::Backend::Bindings bindings{};
         std::vector<std::vector<uint32_t>> kept;   // (each stage's SPIR-V, for the program cache: mesh programs were never kept,
                                                    // so each was translated and its pipeline built in the middle of play, every run)
@@ -1439,7 +1628,18 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
 /// An NVN2 mesh program: the stages that write the internal stage buffer are its task (attribute writes only, when
 /// there are two) and mesh programs; a header-only stage, its per-primitive outputs (shader_lock held)
 const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[8]) {
-    if (!dev.mesh_shader) return nullptr;
+    if (!dev.mesh_shader) {
+        // (no VK_EXT_mesh_shader: these draws take the compute + indirect path once the translated pipelines exist,
+        // docs/arm64-phase3.md. Said once, so a run on such a GPU names the reason instead of silently drawing nothing)
+        if (!(g_vk_emulate_mesh_shader && getenv("RX_VK_MESH_EMU_DRAW"))) {
+            static bool said;
+            if (!said && g_vk_emulate_mesh_shader) {
+                said = true;
+                logf("vk: task/mesh programs are not translated to compute yet; their draws are left out (mesh emulation on)");
+            }
+            return nullptr;
+        }
+    }
     const std::vector<Code>& cs = codes_of(s);
     const Code *fsc = nullptr, *prim = nullptr, *task = nullptr, *mesh = nullptr;
     for (const Code& c : cs) {

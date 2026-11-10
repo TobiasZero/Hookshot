@@ -2,6 +2,7 @@
 // constant buffers, textures) -> a WebGPU render pipeline (cached), bind groups and a draw in the current pass.
 // Vertex and index data are copied from guest memory into the batch's upload stream for each draw (only the range
 // the draw reads).
+#include "rx_cpu.h"
 #include <unordered_set>
 #include <algorithm>
 #include <atomic>
@@ -3473,7 +3474,7 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // the frame rate depends on the replay's time (what making it faster could give)
     if (static const int64_t spin = getenv("RX_DEBUG_DRAW_SPIN_NS") ? atoll(getenv("RX_DEBUG_DRAW_SPIN_NS")) : 0; spin) {
         const int64_t until = clock_ns() + spin;
-        while (clock_ns() < until) _mm_pause();
+        while (clock_ns() < until) RX_CPU_RELAX();
     }
     struct DrawTimer {
         int64_t t0 = clock_ns();

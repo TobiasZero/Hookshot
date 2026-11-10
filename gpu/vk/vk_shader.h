@@ -50,6 +50,20 @@ struct Program {
     bool uses_render_area = false;
     bool uses_push = true;   // (a stage reads the push constants: render area or rescaling)
     bool mesh = false;              // task / mesh stages (VK_EXT_mesh_shader)
+    // (hookshot) a mesh program on a device without VK_EXT_mesh_shader: the mesh stage is a compute module that writes
+    // the emulation ring, and the graphics stage is the pass-through vertex shader. p.stages holds that vertex shader and
+    // the fragment stage, so the ordinary graphics pipeline builds; the compute and finalize pipelines are made with the
+    // layout (vk_draw.cpp ensure_layout).
+    bool emulated_mesh = false;
+    VkShaderModule mesh_compute_module = VK_NULL_HANDLE;
+    VkPipeline mesh_compute_pipeline = VK_NULL_HANDLE;
+    VkShaderModule mesh_task_module = VK_NULL_HANDLE;
+    VkPipeline mesh_task_pipeline = VK_NULL_HANDLE;
+    VkShaderModule mesh_finalize_module = VK_NULL_HANDLE;
+    VkPipeline mesh_finalize_pipeline = VK_NULL_HANDLE;
+    uint32_t mesh_max_vertices = 0;
+    uint32_t mesh_max_primitives = 0;
+    uint32_t mesh_corners = 0;
     // What the translator was told about the bound textures (when it asked: most texture instructions carry their
     // type themselves), by stage and texture descriptor: the variant stands while the textures still answer the same
     struct Answer {

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -276,20 +277,22 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         execution_model = spv::ExecutionModel::Vertex;
         break;
     case Stage::Task:
-        execution_model = spv::ExecutionModel::TaskEXT;
+        execution_model = ctx.mesh_emu ? spv::ExecutionModel::GLCompute : spv::ExecutionModel::TaskEXT;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U,
                              1U);
         break;
     case Stage::Mesh:
-        execution_model = spv::ExecutionModel::MeshEXT;
+        execution_model = ctx.mesh_emu ? spv::ExecutionModel::GLCompute : spv::ExecutionModel::MeshEXT;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, program.workgroup_size[0], 1U,
                              1U);
-        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, program.mesh.max_vertices);
-        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputPrimitivesEXT,
-                             program.mesh.max_primitives);
-        ctx.AddExecutionMode(main, program.mesh.Corners() == 1   ? spv::ExecutionMode::OutputPoints
-                                   : program.mesh.Corners() == 2 ? spv::ExecutionMode::OutputLinesEXT
-                                                                 : spv::ExecutionMode::OutputTrianglesEXT);
+        if (!ctx.mesh_emu) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, program.mesh.max_vertices);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::OutputPrimitivesEXT,
+                                 program.mesh.max_primitives);
+            ctx.AddExecutionMode(main, program.mesh.Corners() == 1   ? spv::ExecutionMode::OutputPoints
+                                       : program.mesh.Corners() == 2 ? spv::ExecutionMode::OutputLinesEXT
+                                                                     : spv::ExecutionMode::OutputTrianglesEXT);
+        }
         break;
     case Stage::TessellationControl:
         execution_model = spv::ExecutionModel::TessellationControl;

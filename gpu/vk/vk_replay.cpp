@@ -30,6 +30,7 @@
 #include "vk_gprof.h"
 #include "vk_framegen.h"
 #include "vk_menu.h"
+#include "vk_mesh_emu.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_state.h"
@@ -1165,6 +1166,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.groups[0] = d.y, da.groups[1] = 1, da.groups[2] = 1;
                 if (d.kind == 0) da.first_task = d.x;   // (hookshot: the task programs add it, vk_draw.cpp's mesh_args)
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
+                if (getenv("RX_VK_LOG_MESH_DECODE")) {
+                    logf("vk: mesh decoded: kind=%d first=%d taskCount=%d groups=%d,%d,%d indirect=%#llx count=%#llx max=%d stride=%d render=%d discard=%d dry=%d",
+                         d.kind, da.first_task, d.kind == 0 ? da.groups[0] : -1,
+                         da.groups[0], da.groups[1], da.groups[2],
+                         (unsigned long long)da.indirect, (unsigned long long)da.count_addr,
+                         da.max, da.stride, s.render_enabled, s.raster_discard, dry);
+                }
                 draw(cmd, s, da);
             }
             s.samples_passed += 16;
@@ -3483,6 +3491,7 @@ uint64_t get_pushed() { return fence(); }
 bool replay_start() {
     menu_init();
     if (!memory_init() || !vma_init(instance_proc())) return false;
+    mesh_emu_init();   // (no mesh shaders: the ring the compute-emulated mesh programs draw from; no-op otherwise)
     VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo tsi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};

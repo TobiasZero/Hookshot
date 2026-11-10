@@ -19,6 +19,10 @@
 
 namespace Shader::Backend::SPIRV {
 
+/// (hookshot) No VK_EXT_mesh_shader: task/mesh programs are emitted as GLCompute that write their outputs to a storage
+/// buffer instead of the mesh output builtins (docs/arm64-phase3.md). Set by the backend before translation.
+extern thread_local bool g_mesh_emu;
+
 static std::bitset<8> clip_distance_written;
 
 using Sirit::Id;
@@ -252,6 +256,11 @@ public:
     Id output_f32{};
     Id output_u32{};
 
+    // (mesh emulation: the storage-buffer pointers the emulated epilogue stores through, instead of Output)
+    bool mesh_emu{};
+    Id mesh_out_f32{};
+    Id mesh_out_u32{};
+
     Id image_buffer_type{};
     Id image_u32{};
 
@@ -393,6 +402,8 @@ public:
         Id variable;    ///< arrayed output
         u32 element;    ///< vector element, or ~0 for a scalar output
         bool is_float;  ///< bitcast the stage buffer word to F32
+        u32 member{};   ///< (mesh emulation: the storage block's member the array is)
+        Id member_pointer{};  ///< (and the pointer type to that member's array)
     };
     Id mesh_payload{};
     Id mesh_payload_u32{};  ///< pointer type to one payload word
@@ -401,6 +412,13 @@ public:
     Id mesh_primitive_count{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
+    Id mesh_primitive_pointer{};  ///< (mesh emulation: the index array's pointer type)
+    u32 mesh_primitive_member{};  ///< (and its member)
+    Id mesh_storage{};            ///< (mesh emulation: the storage-buffer block variable)
+    Id mesh_counter_pointer{};    ///< (and the pointer type to its counter array)
+    Id mesh_loop_counter{};   ///< (mesh emulation: a runtime loop's counter, Workgroup memory)
+    Id mesh_vertex_base{};        ///< (mesh emulation: the workgroup's vertex slot, Workgroup memory)
+    Id mesh_index_base{};         ///< (and its index slot)
     MeshInfo mesh_info{};
     u32 mesh_threads{};
     u32 mesh_attribute_words{};

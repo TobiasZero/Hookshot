@@ -4,7 +4,9 @@
 //   shadertool <file.code> [out.spv]
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <fstream>
+#include <optional>
 #include <vector>
 
 #include "shader_recompiler/backend/bindings.h"
@@ -23,6 +25,10 @@
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/runtime_info.h"
 
+namespace Shader::Backend::SPIRV {
+extern thread_local bool g_mesh_emu;
+}
+
 namespace {
 
 constexpr u32 HeaderSize = sizeof(Shader::ProgramHeader);   // 0x50
@@ -30,16 +36,29 @@ constexpr u32 HeaderSize = sizeof(Shader::ProgramHeader);   // 0x50
 // The environment the frontend reads the lowered program from (Eglantine's GenericEnvironment, without a GPU)
 class FileEnv final : public Shader::Environment {
 public:
-    FileEnv(const std::vector<u8>& bytes, bool graphics) {
+    FileEnv(const std::vector<u8>& bytes, bool graphics,
+            std::optional<Shader::Stage> wanted = std::nullopt,
+            std::array<u32, 3> mesh_regs = {}) {
         using Shader::Ampere::Instruction;
+        if (wanted) {
+            // (--stage mesh/task: the program header's shader_type does not name them, and the mesh registers come
+            // from the stream, not from the code: caller-supplied ones stand in)
+            stage = *wanted;
+            if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+                mesh_registers = mesh_regs;
+                graphics = true;
+            }
+        }
         const u32 native_header = graphics ? 128 : 0;   // (Turing and later: a 128-byte program header)
         if (graphics) {
             std::memcpy(&sph, bytes.data(), sizeof sph);
-            const u32 type = sph.common0.shader_type;   // Maxwell ShaderType: 1 vertex .. 5 pixel
-            stage = type == 1 ? Shader::Stage::VertexB : type == 2 ? Shader::Stage::TessellationControl
-                  : type == 3 ? Shader::Stage::TessellationEval : type == 4 ? Shader::Stage::Geometry
-                  : Shader::Stage::Fragment;
-        } else {
+            if (!wanted) {
+                const u32 type = sph.common0.shader_type;   // Maxwell ShaderType: 1 vertex .. 5 pixel
+                stage = type == 1 ? Shader::Stage::VertexB : type == 2 ? Shader::Stage::TessellationControl
+                      : type == 3 ? Shader::Stage::TessellationEval : type == 4 ? Shader::Stage::Geometry
+                      : Shader::Stage::Fragment;
+            }
+        } else if (!wanted) {
             stage = Shader::Stage::Compute;
         }
         std::vector<Instruction> native;
@@ -100,11 +119,34 @@ public:
 }   // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: shadertool <file.code> [out.spv]\n");
+    const char* path = nullptr;
+    const char* out_path = nullptr;
+    bool emu = false;
+    std::optional<Shader::Stage> wanted;
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--emu")) {
+            emu = true;
+        } else if (!std::strcmp(argv[i], "--stage") && i + 1 < argc) {
+            const char* s = argv[++i];
+            if (!std::strcmp(s, "mesh")) wanted = Shader::Stage::Mesh;
+            else if (!std::strcmp(s, "task")) wanted = Shader::Stage::Task;
+            else if (!std::strcmp(s, "compute")) wanted = Shader::Stage::Compute;
+            else if (!std::strcmp(s, "vertex")) wanted = Shader::Stage::VertexB;
+            else if (!std::strcmp(s, "fragment")) wanted = Shader::Stage::Fragment;
+            else { std::fprintf(stderr, "unknown stage: %s\n", s); return 2; }
+        } else if (!path) {
+            path = argv[i];
+        } else if (!out_path) {
+            out_path = argv[i];
+        }
+    }
+    if (!path) {
+        std::fprintf(stderr,
+                     "usage: shadertool <file.code> [out.spv] [--stage mesh|task|compute|vertex|fragment]\n");
         return 2;
     }
-    std::ifstream in(argv[1], std::ios::binary);
+    std::ifstream in(path, std::ios::binary);
+    Shader::Backend::SPIRV::g_mesh_emu = emu;
     std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), {});
     try {
         // a graphics program starts with its header (shader type 1-5 in common0); compute programs do not
@@ -114,7 +156,7 @@ int main(int argc, char** argv) {
         bool graphics = type >= 1 && type <= 5;
         // the control section beside it (<code address>.ctl) has the NVN stage: 5 is compute (a compute program's
         // first word can look like a header)
-        std::string ctl_path = argv[1];
+        std::string ctl_path = path;
         if (ctl_path.size() > 5 && ctl_path.substr(ctl_path.size() - 5) == ".code") {
             ctl_path = ctl_path.substr(0, ctl_path.size() - 5) + ".ctl";
             std::ifstream cin_(ctl_path, std::ios::binary);
@@ -125,7 +167,15 @@ int main(int argc, char** argv) {
                 graphics = st != 5;
             }
         }
-        FileEnv env(bytes, graphics);
+        // (--stage mesh/task: the stream's mesh registers, as a plausible one sets them: 64 vertices, 126 triangles, 64
+        // threads, a one-line payload)
+        std::array<u32, 3> mesh_regs{
+            (126u << 13) | (64u << 4) | 4u,
+            (64u << 20),
+            1u | (1u << 12) | (1u << 22),
+        };
+        FileEnv env(bytes, graphics, wanted, mesh_regs);
+        const bool gfx = env.ShaderStage() != Shader::Stage::Compute;
         Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_blocks;
         Shader::ObjectPool<Shader::IR::Inst> insts;
         Shader::ObjectPool<Shader::IR::Block> blocks;
@@ -137,20 +187,21 @@ int main(int argc, char** argv) {
         Shader::IR::Program program = Shader::Maxwell::TranslateProgram(insts, blocks, env, cfg, host);
         Shader::Profile profile{};
         profile.supported_spirv = 0x00010600;
+        profile.unified_descriptor_binding = true;
         profile.support_int8 = profile.support_int16 = profile.support_int64 = true;
         profile.support_descriptor_aliasing = profile.support_float_controls = true;
         profile.support_vertex_instance_id = true;
         profile.support_separate_denorm_behavior = profile.support_separate_rounding_mode = true;
         std::vector<u32> spirv;
-        if (graphics) {
+        if (gfx) {
             Shader::RuntimeInfo runtime{};
             Shader::Backend::Bindings bindings{};
             spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
         } else {
             spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
         }
-        std::printf("%s: %s, %zu native instructions captured, %zu Maxwell words, SPIR-V %zu words\n", argv[1],
-                    graphics ? "graphics" : "compute", env.captured, env.code.size(), spirv.size());
+        std::printf("%s: %s, %zu native instructions captured, %zu Maxwell words, SPIR-V %zu words\n", path,
+                    gfx ? "graphics" : "compute", env.captured, env.code.size(), spirv.size());
         // what the program reads from the constant banks (the driver's layout: NVN state the replay must answer)
         const Shader::Info& info = program.info;
         for (u32 i = 0; i < Shader::Info::MAX_CBUFS; i++)
@@ -166,12 +217,12 @@ int main(int argc, char** argv) {
             std::printf("  texture buffer handle c%u[%#x]\n", d.cbuf_index, d.cbuf_offset);
         for (const auto& d : info.image_descriptors) std::printf("  image handle c%u[%#x]\n", d.cbuf_index, d.cbuf_offset);
         std::printf("  texture bound buffer c%u\n", env.texture_bound);
-        if (argc > 2) {
-            std::ofstream out(argv[2], std::ios::binary);
+        if (out_path) {
+            std::ofstream out(out_path, std::ios::binary);
             out.write(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4);
         }
     } catch (const std::exception& e) {
-        std::printf("%s: FAILED: %s\n", argv[1], e.what());
+        std::printf("%s: FAILED: %s\n", path, e.what());
         return 1;
     }
     return 0;

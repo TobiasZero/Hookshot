@@ -30,6 +30,8 @@
 #include "vk_dump.h"
 #include "vk_gprof.h"
 #include "vk_jobs.h"
+#include "mesh_passthrough_vs.h"
+#include "vk_mesh_emu.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
 #include "movie_upscale_policy.h"
@@ -599,17 +601,68 @@ void ensure_layout(Program& p) {
     vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set_layout);
     VkShaderStageFlags stages = 0;
     for (const Stage& st : p.stages) stages |= st.vk_stage;
+    // (hookshot) an emulated mesh program also reads the emulation ring, as set 1: the compute stage that runs the
+    // translated program and the pass-through vertex shader that draws it)
+    const bool mesh_emulated = p.emulated_mesh ||
+                               (g_vk_emulate_mesh_shader &&
+                                std::any_of(p.stages.begin(), p.stages.end(), [](const Stage& st) {
+                                    return (st.vk_stage & (VK_SHADER_STAGE_TASK_BIT_EXT |
+                                                           VK_SHADER_STAGE_MESH_BIT_EXT)) != 0;
+                                }));
+    VkDescriptorSetLayout set_layouts[2]{p.set_layout, VK_NULL_HANDLE};
+    uint32_t set_count = 1;
+    if (mesh_emulated && (set_layouts[1] = mesh_emu_set_layout()) != VK_NULL_HANDLE) {
+        set_count = 2;
+        stages |= VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT;
+    }
     const VkPushConstantRange range{stages, 0, kPushSize};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pi.setLayoutCount = 1;
-    pi.pSetLayouts = &p.set_layout;
+    pi.setLayoutCount = set_count;
+    pi.pSetLayouts = set_layouts;
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &range;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+    if (p.emulated_mesh && p.mesh_compute_module) {   // (the mesh stage's compute pipeline, and the finalize pass)
+        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = p.mesh_compute_module;
+        stage.pName = "main";
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = stage;
+        ci.layout = layout;
+        logf("vk: emu %016llx: creating the mesh compute pipeline (%u verts, %u prims)",
+             (unsigned long long)p.key, p.mesh_max_vertices, p.mesh_max_primitives);
+        VkResult emu_r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                                  &p.mesh_compute_pipeline);
+        logf("vk: emu %016llx: mesh compute pipeline -> %d", (unsigned long long)p.key, (int)emu_r);
+        if (p.mesh_task_module) {   // (the task stage: its compute dispatch leaves the mesh count behind)
+            stage.module = p.mesh_task_module;
+            ci.stage = stage;
+            logf("vk: emu %016llx: creating the task compute pipeline", (unsigned long long)p.key);
+            emu_r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                             &p.mesh_task_pipeline);
+            logf("vk: emu %016llx: task compute pipeline -> %d", (unsigned long long)p.key, (int)emu_r);
+            stage.module = p.mesh_compute_module;
+        }
+        const std::vector<uint32_t> fin = mesh_finalize_spv(1, 4, p.mesh_max_vertices * 64,
+                                                              p.mesh_max_primitives * 64, p.mesh_corners);   // (the index counter, then the command)
+        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        sm.codeSize = fin.size() * sizeof(uint32_t);
+        sm.pCode = fin.data();
+        logf("vk: emu %016llx: finalize module of %zu words", (unsigned long long)p.key, fin.size());
+        if (vkCreateShaderModule(dev.device, &sm, nullptr, &p.mesh_finalize_module) == VK_SUCCESS) {
+            stage.module = p.mesh_finalize_module;
+            ci.stage = stage;
+            logf("vk: emu %016llx: creating the finalize pipeline", (unsigned long long)p.key);
+            emu_r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                             &p.mesh_finalize_pipeline);
+            logf("vk: emu %016llx: finalize pipeline -> %d", (unsigned long long)p.key, (int)emu_r);
+        }
+    }
     p.push_stages = stages;
     for (const Stage& st : p.stages) p.uses_render_area |= st.info.uses_render_area;
-    p.uses_push = p.uses_render_area;
+    p.uses_push = p.uses_render_area || p.emulated_mesh;
     for (const Stage& st : p.stages) p.uses_push |= st.info.uses_rescaling_uniform;
     static const bool follow_graphics = !getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0;
     for (const Stage& st : p.stages)   // (the page table; EvilOOT: and graphics stages with RX_VK_FOLLOW_GRAPHICS)
@@ -895,7 +948,7 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
     output = mix(output, at.depth ? (uint64_t)at.depth_format : 0);
     VkPipeline libs[4];
     uint32_t n = 0;
-    if (!p.mesh) libs[n++] = gpl_part(p, s, at, topo, 0, input);
+    if (!p.mesh || p.emulated_mesh) libs[n++] = gpl_part(p, s, at, topo, 0, input);
     libs[n++] = gpl_part(p, s, at, topo, 1, program);
     libs[n++] = gpl_part(p, s, at, topo, 2, mix(program, (uint64_t)at.samples));
     libs[n++] = gpl_part(p, s, at, topo, 3, output);
@@ -1048,6 +1101,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     for (const Stage& st : p.stages) {
+        if (st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT) continue;
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = st.vk_stage;
         si.module = st.module;
@@ -1108,7 +1162,11 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     vi.pVertexAttributeDescriptions = va.data();
     if (!vdivs.empty()) vi.pNext = &vdi;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = topo;
+    ia.topology = p.emulated_mesh
+                      ? (p.mesh_corners == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                       : p.mesh_corners == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                             : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                      : topo;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     // (dynamic: left out, or each value of them would be another library)
@@ -1168,12 +1226,13 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         if (depth_aspect(at.depth_format)) ri.depthAttachmentFormat = at.depth_format;
         if (has_stencil(at.depth_format)) ri.stencilAttachmentFormat = at.depth_format;
     }
+    const bool native_mesh = p.mesh && !p.emulated_mesh;
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     ci.pNext = &ri;
     ci.stageCount = (uint32_t)stages.size();
     ci.pStages = stages.data();
-    ci.pVertexInputState = p.mesh ? nullptr : &vi;
-    ci.pInputAssemblyState = p.mesh ? nullptr : &ia;
+    ci.pVertexInputState = native_mesh ? nullptr : &vi;
+    ci.pInputAssemblyState = native_mesh ? nullptr : &ia;
     ci.pViewportState = &vp;
     ci.pRasterizationState = &rs;
     ci.pMultisampleState = &ms;
@@ -4554,6 +4613,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (exposure_log_on() && cp) exposure_note(s, *cp);
     if (cp->failed) SKIP_HERE();
     Program& p = const_cast<Program&>(*cp);
+    if (p.emulated_mesh) {
+        topo = p.mesh_corners == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+             : p.mesh_corners == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                   : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
     PipeEntry* pe;
     {
         PROF(PROF_PIPE);
@@ -4608,7 +4672,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // when none changed since the last draw, the set it pushed or bound stands)
     const uint64_t reg_gen = registrations_generation(), ub_gen = ub_generation();
     static const bool no_reuse = getenv("RX_VK_NO_DESC_REUSE") != nullptr;   // (A/B: every draw builds its own)
-    const bool same_desc = !no_reuse && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
+    const bool same_desc = !no_reuse && !p.emulated_mesh && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
                            last_desc_reg == reg_gen && last_desc_ub == ub_gen;
     if (!same_desc) {
         PROF(PROF_DESC);
@@ -4865,6 +4929,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             }
         }
         if (d.indirect) {
+            if (p.emulated_mesh || !vkCmdDrawMeshTasksIndirectEXT) {
+                return;
+            }
             BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
             if (mesh_conv_buf) {   // (EvilOOT: the records as {count, 1, 1}, mesh_indirect_convert)
                 if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
@@ -4899,6 +4966,65 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 const uint64_t firsts = mesh_args_address + (uint64_t)at * 16 + 12;
                 vkCmdPushConstants(cmd, p.layout, p.push_stages, Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, 8, &firsts);
             }
+            if (p.emulated_mesh) {
+                // (no VK_EXT_mesh_shader: the mesh stage as a compute dispatch, the finalize pass, then the indexed
+                // indirect draw with the pass-through vertex shader)
+                const uint32_t groups = (uint32_t)std::max(d.groups[0], 0);
+                if (groups != 0 && p.mesh_compute_pipeline && p.mesh_finalize_pipeline &&
+                    (!p.mesh_task_module || p.mesh_task_pipeline)) {
+                    static thread_local std::vector<MeshEmuRegion> regions;
+                    regions.clear();
+                    end_pass(cmd);
+                    mesh_emu_compute_begin(cmd);
+                    if (bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) {
+                        push_constants(cmd, p, &at);
+                        if (p.mesh_task_pipeline) {
+                            const uint32_t gy = (uint32_t)std::max(d.groups[1], 1);
+                            const uint32_t gz = (uint32_t)std::max(d.groups[2], 1);
+                            const uint32_t capped = std::min(groups, 256u);
+                            for (uint32_t t = 0; t < capped; ++t) {
+                                MeshEmuRegion region = mesh_emu_alloc(p.mesh_max_vertices * 64, p.mesh_max_primitives * 64 * 4);
+                                if (region.offset == kMeshEmuNoRoom) break;
+                                const uint32_t first_task = (uint32_t)d.first_task + t;
+                                mesh_emu_clear(cmd, region, 0, 64, first_task);
+                                mesh_emu_task_dispatch(cmd, p.mesh_task_pipeline, p.layout, region, 1, gy, gz);
+                                mesh_emu_dispatch_indirect(cmd, p.mesh_compute_pipeline, p.layout, region);
+                                mesh_emu_finalize(cmd, p.mesh_finalize_pipeline, p.layout, region);
+                                regions.push_back(region);
+                            }
+                        } else {
+                            for (uint32_t first = 0; first < groups; first += 64) {
+                                const uint32_t chunk = std::min(groups - first, 64u);
+                                MeshEmuRegion region = mesh_emu_alloc(p.mesh_max_vertices * 64, p.mesh_max_primitives * 64 * 4);
+                                if (region.offset == kMeshEmuNoRoom) break;
+                                mesh_emu_clear(cmd, region, 0, 64, (uint32_t)d.first_task + first);
+                                mesh_emu_dispatch(cmd, p.mesh_compute_pipeline, p.layout, region, chunk);
+                                mesh_emu_finalize(cmd, p.mesh_finalize_pipeline, p.layout, region);
+                                regions.push_back(region);
+                            }
+                        }
+                    }
+                    if (!regions.empty()) mesh_emu_compute_done(cmd);   // (outside the render pass)
+                    begin_pass(cmd, at);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
+                    last_pipeline = pl;
+                    if (!regions.empty() && bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) {
+                        push_constants(cmd, p, &at);
+                        last_dyn_valid = false;
+                        dyn_fast.on = false;
+                        dynamic_state(cmd, s, at, topo, d.mesh);
+                        for (const MeshEmuRegion& region : regions) {
+                            mesh_emu_bind(cmd, p.layout, VK_PIPELINE_BIND_POINT_GRAPHICS, region.offset);
+                            mesh_emu_draw_indirect(cmd, region, pl);
+                            last_ib.on = false;
+                        }
+                        st_mesh++;
+                        st_draws++, pass.draws++;
+                    }
+                }
+                return;
+            }
+            if (!vkCmdDrawMeshTasksEXT) return;
             vkCmdDrawMeshTasksEXT(cmd, (uint32_t)std::max(d.groups[0], 0), (uint32_t)std::max(d.groups[1], 1),
                                   (uint32_t)std::max(d.groups[2], 1));
         }

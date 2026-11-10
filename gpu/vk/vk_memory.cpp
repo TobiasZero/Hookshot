@@ -65,6 +65,10 @@ struct Pool {
     bool inherit_pending = false;
     uint64_t retired_epoch = 0;
     bool prefetched = false;     // (amd-fix) imported ahead by the background thread, not bound yet
+    // (UMA copy mode: no VK_EXT_external_memory_host, so the pool is host-visible device memory of our own and the
+    // CPU copies the game's pages into it; see "UMA copy pools" below)
+    void* map = nullptr;
+    uint64_t copy_epoch = 0;     // (the submission its dirty pages were last copied in for)
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -88,6 +92,7 @@ SrwMutex pools_mu;
 uint32_t generation = ~0u;
 uint64_t align = 4096;
 uint64_t max_import_size = UINT64_MAX;
+bool copy_pools = false;   // (no VK_EXT_external_memory_host: host-visible device memory the CPU copies the game's pages into)
 int failures = 0;
 ImportHolds import_holds;          // (issue 218: a failed import is not tried again for ImportHolds::kGapMs)
 std::mutex import_holds_mu;
@@ -105,6 +110,44 @@ bool import_on_hold(uint64_t lo, uint64_t hi) {
 void import_remember_failure(uint64_t lo, uint64_t hi) {
     std::lock_guard lk(import_holds_mu);
     import_holds.deny_for(lo, hi, import_now_ms());
+}
+
+// ---- copy pools: the GPU -> guest direction -----------------------------------------------------------------------
+// The GPU writes into a copy pool's buffer; guest memory gets the data back once the submission that wrote it is done.
+// The completion is known when the next submission starts (completed(), memory_take_capture), which is also before the
+// next recording reads guest memory. One submission of delay at worst, never a blocking wait. pools_mu held.
+struct CopyWriteBack { uint64_t value; Pool* pool; uint64_t lo, hi; };
+std::vector<CopyWriteBack> copy_wbs;
+
+void copy_run(Pool& p, uint64_t lo, uint64_t hi) {
+    if (!p.map || hi <= lo) return;
+    memcpy(host->guest_base() + p.lo + lo, (uint8_t*)p.map + lo, (size_t)(hi - lo));
+}
+
+void copy_flush_locked(uint64_t completed) {
+    if (copy_wbs.empty()) return;
+    std::vector<CopyWriteBack> keep, done;
+    keep.reserve(copy_wbs.size());
+    for (const CopyWriteBack& w : copy_wbs) (w.value <= completed ? done : keep).push_back(w);
+    if (done.empty()) return;
+    std::sort(done.begin(), done.end(), [](const CopyWriteBack& a, const CopyWriteBack& b) {
+        return a.pool != b.pool ? a.pool < b.pool : a.lo < b.lo;
+    });
+    for (size_t i = 0; i < done.size();) {
+        Pool* p = done[i].pool;
+        uint64_t run_lo = done[i].lo, run_hi = done[i].hi;
+        for (i++; i < done.size() && done[i].pool == p; i++) {
+            if (done[i].lo <= run_hi) run_hi = std::max(run_hi, done[i].hi);
+            else copy_run(*p, run_lo, run_hi), run_lo = done[i].lo, run_hi = done[i].hi;
+        }
+        copy_run(*p, run_lo, run_hi);
+    }
+    copy_wbs.swap(keep);
+}
+
+void copy_flush(uint64_t completed) {
+    std::lock_guard<SrwMutex> lk(pools_mu);
+    copy_flush_locked(completed);
 }
 
 constexpr VkBufferUsageFlags kUsage =
@@ -313,6 +356,77 @@ bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
 }
 #endif
 
+// ---- UMA copy pools ---------------------------------------------------------------------------------------------
+// Without VK_EXT_external_memory_host (the Adreno X1-85) there is no way to make a Vulkan allocation *be* the game's
+// pages: the guest addresses its memory as A64_MEM + addr, and a Vulkan allocation's host pointer is the driver's.
+// So each pool is a buffer in host-visible device memory of our own, mapped, and the CPU copies the game's pages in:
+// the whole range at the first bind, then only the pages the CPU wrote (the generations that drive the mirror path).
+// On a UMA part the copy is RAM to RAM; there is no staging buffer and no third copy. See docs/arm64-phase2.md.
+bool import_pool_copy(uint64_t lo, uint64_t hi, Pool& p) {
+    const uint64_t bytes = hi - lo;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = bytes;
+    bi.usage = kUsage;
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &p.buffer) != VK_SUCCESS) {
+        import_remember_failure(lo, hi);
+        return false;
+    }
+    VkMemoryRequirements mr{};
+    vkGetBufferMemoryRequirements(dev.device, p.buffer, &mr);
+    // (the type the brief asked for: device local and host visible at once, coherent so no flush is needed. HOST_CACHED
+    // first: the readback direction is faster from cacheable memory)
+    uint32_t type = UINT32_MAX;
+    for (int pass = 0; pass < 3 && type == UINT32_MAX; pass++) {
+        const VkMemoryPropertyFlags want = pass == 0
+            ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+               VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+            : pass == 1
+                ? (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)
+            if ((mr.memoryTypeBits >> i & 1) && (dev.memory.memoryTypes[i].propertyFlags & want) == want) type = i;
+    }
+    if (type == UINT32_MAX) {
+        logf("vk: no host-visible device memory for a %llu MB pool: cannot copy it in", (unsigned long long)(bytes >> 20));
+        vkDestroyBuffer(dev.device, p.buffer, nullptr);
+        p.buffer = VK_NULL_HANDLE;
+        import_remember_failure(lo, hi);
+        return false;
+    }
+    VkMemoryAllocateFlagsInfo fl{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    fl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &fl;
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = type;
+    const VkResult allocated = vkAllocateMemory(dev.device, &ai, nullptr, &p.memory);
+    if (allocated != VK_SUCCESS) {
+        import_result = allocated;
+        vkDestroyBuffer(dev.device, p.buffer, nullptr);
+        p.buffer = VK_NULL_HANDLE;
+        import_remember_failure(lo, hi);
+        return false;
+    }
+    vkBindBufferMemory(dev.device, p.buffer, p.memory, 0);
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = p.buffer;
+    p.address = vkGetBufferDeviceAddress(dev.device, &da);
+    if (vkMapMemory(dev.device, p.memory, 0, VK_WHOLE_SIZE, 0, &p.map) != VK_SUCCESS || !p.map) {
+        logf("vk: a %llu MB copy pool could not be mapped", (unsigned long long)(bytes >> 20));
+        vkDestroyBuffer(dev.device, p.buffer, nullptr);
+        vkFreeMemory(dev.device, p.memory, nullptr);
+        p.memory = VK_NULL_HANDLE, p.buffer = VK_NULL_HANDLE, p.map = nullptr;
+        import_remember_failure(lo, hi);
+        return false;
+    }
+    p.synced_gen = 0;   // (copy_sync writes the whole range in at the first bind; 0 = never seeded)
+    static int logged;
+    if (logged++ < 8)
+        logf("vk: copy pool %#llx..%#llx (%llu MB) in memory type %u (device local, host visible)", (unsigned long long)lo,
+             (unsigned long long)hi, (unsigned long long)(bytes >> 20), type);
+    return true;
+}
+
 bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     import_cooling = false;
     import_result = VK_SUCCESS;
@@ -359,6 +473,10 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
         return true;
     }
 #endif
+    if (copy_pools) {   // (no host-pointer import on this device: a buffer of our own, copied in at the first bind)
+        t1 = t2 = t3 = t4 = clk::now();
+        return import_pool_copy(lo, hi, p);
+    }
     // (the host allocations' memory type: the same for every pointer, asked once)
     static uint32_t type = UINT32_MAX;
     if (type == UINT32_MAX) {
@@ -523,21 +641,25 @@ uint64_t memory_guest_pages() {
 }
 
 bool memory_init() {
-    if (!dev.external_memory_host) {
-        logf("vk: no VK_EXT_external_memory_host: the guest memory cannot be imported (needed for now)");
-        return false;
-    }
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
-    hp.pNext = &p11;
+    if (dev.external_memory_host) hp.pNext = &p11, p2.pNext = &hp;
+    else p2.pNext = &p11;
     p11.pNext = &p13;
-    p2.pNext = &hp;
     vkGetPhysicalDeviceProperties2(dev.physical, &p2);
-    align = std::max<uint64_t>(hp.minImportedHostPointerAlignment, 4096);
     max_import_size = std::min(p11.maxMemoryAllocationSize, p13.maxBufferSize);
+    if (!dev.external_memory_host) {
+        // (the Adreno X1-85: host-pointer import is not exposed. The pools are copied into host-visible device memory
+        // instead — import_pool_copy; one copy per changed page, RAM to RAM on a UMA part, not zero copy)
+        copy_pools = true;
+        align = 4096;
+        logf("vk: no VK_EXT_external_memory_host: guest pools are copied into host-visible device memory (UMA copy mode)");
+        return true;
+    }
+    align = std::max<uint64_t>(hp.minImportedHostPointerAlignment, 4096);
     logf("vk: guest memory imported in place (alignment %llu)", (unsigned long long)align);
     return true;
 }
@@ -1518,6 +1640,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
 }
 bool memory_take_capture(uint64_t value, uint64_t completed) {
     if (completed > mem_completed) mem_completed = completed;
+    copy_flush(completed);   // (the copy pools the GPU wrote into, now done: guest memory gets them back)
     if (!capture_on()) return false;
     std::unique_ptr<Capture> c;
     {
@@ -1532,6 +1655,7 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
 /// (vk_replay.cpp resume_queue): the CPU's writes up to that signal, which the console's GPU reads after its wait
 bool memory_capture_now(uint64_t value, uint64_t completed) {
     if (completed > mem_completed) mem_completed = completed;
+    copy_flush(completed);   // (as memory_take_capture: a submission done, its copy pools' writes back in guest memory)
     std::unique_ptr<Capture> c = capture_make();
     return c && take_capture(std::move(c), value, completed);
 }
@@ -2044,6 +2168,40 @@ void mirror_sync(Pool& p) {
     st_sync_copies += (int64_t)runs.size();
 }
 
+/// The pages of a copy pool the CPU wrote since the last copy, copied into its mapped device memory (pools_mu held).
+/// The same generations the mirror path uses: a clean 2 MB region is skipped whole, and a pool's first bind copies the
+/// whole range, because pages the game never touched are zero in guest memory and uninitialized in the buffer.
+void copy_sync(Pool& p) {
+    p.copy_epoch = mirror_epoch;
+    if (!p.map) return;
+    const uint8_t* src = host->guest_base() + p.lo;
+    uint8_t* dst = (uint8_t*)p.map;
+    if (!p.synced_gen) {
+        memcpy(dst, src, (size_t)(p.hi - p.lo));
+        p.synced_gen = gen_now;
+        return;
+    }
+    uint64_t run_lo = 0, run_hi = 0;
+    for (uint64_t page = p.lo >> kPageShift; page < (p.hi + 4095) >> kPageShift;) {
+        if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen) {
+            page += kRegionPages;   // (a clean 2 MB region)
+            continue;
+        }
+        if (page_gen(page) > p.synced_gen) {
+            const uint64_t a = std::max(page << kPageShift, p.lo) - p.lo;
+            const uint64_t b = std::min((page + 1) << kPageShift, p.hi) - p.lo;
+            if (run_hi == a) run_hi = b;
+            else {
+                if (run_hi) memcpy(dst + run_lo, src + run_lo, (size_t)(run_hi - run_lo));
+                run_lo = a, run_hi = b;
+            }
+        }
+        page++;
+    }
+    if (run_hi) memcpy(dst + run_lo, src + run_lo, (size_t)(run_hi - run_lo));
+    p.synced_gen = gen_now;
+}
+
 } // namespace
 
 // ---- (from PR 430, YunaraDebugs) Readback pages: GPU results the CPU reads (invalidate) and then writes, as OoT's exposure meter (a
@@ -2254,7 +2412,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // lookup under the lock was ~8% of the replay's time in a race); the rest under it, as below)
     const bool par = par_active.load(std::memory_order_relaxed);
     TlPool& tl = tl_pools[(guest >> 16) & 1023];
-    if (!written && tl.p && tl.gen == pools_gen.load(std::memory_order_relaxed) && guest >= tl.p->lo &&
+    if (!written && !copy_pools && tl.p && tl.gen == pools_gen.load(std::memory_order_relaxed) && guest >= tl.p->lo &&
         guest + size <= tl.p->hi) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
@@ -2273,7 +2431,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
-        if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
+        if (copy_pools) {   // (no import: the game's pages copied into the pool's mapped device memory, once a submission)
+            if (p->copy_epoch != mirror_epoch) copy_sync(*p);
+            if (written) copy_wbs.push_back({mem_rec_value, p, off, std::min(off + size, p->hi - p->lo)});
+        } else if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
         return remember({p->buffer, off, size, 0});
     }
     // (a pool's mirror is made at its first binding, in this part's uploads: bound in guest memory until the next
@@ -2328,7 +2489,7 @@ std::deque<DeadMirror> dead_mirrors;
 // Forest ~1.3 GB of imports, 15-45 ms a submission (3-4 fps on an RX 7800 XT with 11 ms of GPU time; issues 312, 413). Its
 // table entries went at its retirement, and its mirror goes before (mstate), so once the GPU is past retired_value nothing
 // reaches it. The node stays (pointers to it are kept elsewhere); only its buffer and memory go. RX_VK_KEEP_RETIRED=1: kept
-struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; uint64_t value; uint64_t bytes; std::vector<VkDeviceMemory> pieces; };
+struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; void* map; uint64_t value; uint64_t bytes; std::vector<VkDeviceMemory> pieces; };
 std::deque<DeadImport> dead_imports;
 uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
 void reap_mirrors() {   // (pools_mu held)
@@ -2343,6 +2504,7 @@ void reap_mirrors() {   // (pools_mu held)
         dead_mirrors.pop_front();
     }
     while (!dead_imports.empty() && dead_imports.front().value <= mem_completed) {
+        if (dead_imports.front().map) vkUnmapMemory(dev.device, dead_imports.front().memory);
         vkDestroyBuffer(dev.device, dead_imports.front().buffer, nullptr);
         vkFreeMemory(dev.device, dead_imports.front().memory, nullptr);
         for (VkDeviceMemory m : dead_imports.front().pieces) vkFreeMemory(dev.device, m, nullptr);
@@ -2355,9 +2517,9 @@ void retired_imports_give_back() {   // (pools_mu held)
     // B390 lost the device entering Kokiri every time with it and 1 run in 5 without (issue 17, fuxau); the AMD device losses
     // on the Ally X (309) and RX 6600 (571) came right after retired pools went back. RX_VK_KEEP_RETIRED=0 or 1 chooses
 #ifdef _WIN32
-    static const bool keep = !getenv("RX_VK_KEEP_RETIRED") || getenv("RX_VK_KEEP_RETIRED")[0] != '0';
+    static const bool keep = !copy_pools && (!getenv("RX_VK_KEEP_RETIRED") || getenv("RX_VK_KEEP_RETIRED")[0] != '0');
 #else
-    static const bool keep = getenv("RX_VK_KEEP_RETIRED") && getenv("RX_VK_KEEP_RETIRED")[0] != '0';
+    static const bool keep = !copy_pools && getenv("RX_VK_KEEP_RETIRED") && getenv("RX_VK_KEEP_RETIRED")[0] != '0';
 #endif
     uint64_t live_bytes = 0, retired_bytes = 0;
     size_t retired_alive = 0;
@@ -2367,9 +2529,9 @@ void retired_imports_give_back() {   // (pools_mu held)
         if (!p.memory) continue;
         if (!keep && p.mstate == Pool::MIRROR_NONE && !p.inherit_pending && p.retired_value <= mem_completed &&
             p.last_value <= mem_completed) {
-            dead_imports.push_back({p.buffer, p.memory, std::max(mem_rec_value, p.last_value), p.hi - p.lo, std::move(p.pieces)});
+            dead_imports.push_back({p.buffer, p.memory, p.map, std::max(mem_rec_value, p.last_value), p.hi - p.lo, std::move(p.pieces)});
             p.pieces.clear();
-            p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0;
+            p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0, p.map = nullptr;
             pools_gen++;
             continue;
         }
@@ -2438,20 +2600,83 @@ std::deque<std::map<uint64_t, Pool>::node_type> evicted_pools;
 int64_t st_imports_evicted = 0;
 uint64_t st_import_bytes_evicted = 0;
 constexpr uint64_t kImportIdle = 600;
+constexpr uint64_t kCopyIdle = 120;   // (copy mode: 2 s at 60 fps, a pool bound less recently than that is idle)
+
+/// Bytes the copy pools hold now (pools_mu held). Unlike imports, a copy pool is device memory we allocated, so the
+/// device-local heap is what runs out; the system-heap accounting below sees only non-device-local heaps and is off here.
+uint64_t copy_live_bytes() {
+    uint64_t n = 0;
+    for (const auto& [lo, p] : imported)
+        if (p.map) n += p.hi - p.lo;
+    for (const auto& nh : retired_pools)
+        if (nh.mapped().map) n += nh.mapped().hi - nh.mapped().lo;
+    for (const auto& nh : evicted_pools)
+        if (nh.mapped().map) n += nh.mapped().hi - nh.mapped().lo;
+    return n;
+}
+
+/// How much device memory the copy pools may hold: RX_VK_COPY_MB, else two thirds of the largest device-local heap
+/// (5.2 GiB on the Adreno X1-85's 7.8 GiB). The rest is textures and the driver.
+uint64_t copy_budget() {
+    static const uint64_t b = [] {
+        if (const char* e = getenv("RX_VK_COPY_MB")) return (uint64_t)atoll(e) << 20;
+        uint64_t vram = 0;
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+            if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                vram = std::max(vram, (uint64_t)dev.memory.memoryHeaps[h].size);
+        return vram ? vram / 3 * 2 : (uint64_t)(4ull << 30);
+    }();
+    return b;
+}
 
 void imports_give_back() {   // (pools_mu held)
     while (!evicted_pools.empty() && evicted_pools.front().mapped().retired_value <= mem_completed) {
         Pool& p = evicted_pools.front().mapped();
+        if (p.map) vkUnmapMemory(dev.device, p.memory);
         vkDestroyBuffer(dev.device, p.buffer, nullptr);
         vkFreeMemory(dev.device, p.memory, nullptr);
         for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);   // (a pool imported as several dma-bufs)
         evicted_pools.pop_front();
     }
+    if (copy_pools) {
+        // (copy pools are device memory of ours: evict the ones nothing bound for kCopyIdle submissions once over the
+        // budget. The system-heap path below only counts non-device-local heaps, and this device has none)
+        static uint64_t calls;
+        if (++calls % 16) return;
+        uint64_t live = copy_live_bytes();
+        const uint64_t budget = copy_budget();
+        if (live <= budget) return;
+        const uint64_t target = budget / 4 * 3;
+        std::vector<std::map<uint64_t, Pool>::iterator> idle;
+        for (auto it = imported.begin(); it != imported.end(); ++it) {
+            const Pool& p = it->second;
+            if (p.last_value <= mem_completed && mem_rec_value > p.last_value + kCopyIdle) idle.push_back(it);
+        }
+        std::sort(idle.begin(), idle.end(), [](auto a, auto b) { return a->second.last_value < b->second.last_value; });
+        uint64_t freed = 0;
+        int n = 0;
+        for (auto it : idle) {
+            if (live <= target) break;
+            Pool& p = it->second;
+            guest_pages_set(p.lo, p.hi, 0);
+            p.retired_value = mem_rec_value;   // (this submission's recording is being made: freed once it is done)
+            live -= p.hi - p.lo;
+            freed += p.hi - p.lo;
+            st_imports_evicted++, st_import_bytes_evicted += p.hi - p.lo;
+            evicted_pools.push_back(imported.extract(it));
+            n++;
+        }
+        static int logged;
+        if (n || logged++ < 4)
+            logf("vk: copy pools: %llu of %llu MB; %d idle given back (%llu MB)", (unsigned long long)(live >> 20),
+                 (unsigned long long)(budget >> 20), n, (unsigned long long)(freed >> 20));
+        return;
+    }
     // (hookshot) Off by default on Windows, as giving retired imports back is (RX_VK_KEEP_RETIRED, retired_imports_give_back:
     // device losses on Intel Arc and AMD right after imports went back): RX_VK_IMPORT_HIGH=85 turns it on there
     static const char* env_high = getenv("RX_VK_IMPORT_HIGH");
 #ifdef _WIN32
-    static const int high = env_high ? atoi(env_high) : 0;
+    static const int high = env_high ? atoi(env_high) : (copy_pools ? 85 : 0);
 #else
     static const int high = env_high ? atoi(env_high) : 85;
 #endif
@@ -2509,6 +2734,7 @@ void imports_give_back() {   // (pools_mu held)
 
 void memory_begin_submission() {
     std::lock_guard lk(pools_mu);
+    copy_flush_locked(mem_completed);   // (before anything is given back: the pools the GPU wrote into are still mapped)
     reap_mirrors();
     retired_imports_give_back();
     mirror_epoch++;

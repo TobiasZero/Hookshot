@@ -57,6 +57,7 @@ void load_device(VkDevice device) {
 namespace mkwvk {
 
 std::vector<std::string> gpu_device_names;
+bool g_vk_emulate_mesh_shader = false;
 const MkwVkHost* host;
 int64_t prof_ns[PROF_COUNT];
 Device dev;
@@ -671,14 +672,20 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         return nullptr;
     }
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
-    logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
+    {   // (hookshot) no mesh shaders: the translated task/mesh programs take the compute + indirect draw path (phase 3)
+        const char* e = getenv("RX_VK_EMULATE_MESH");
+        g_vk_emulate_mesh_shader = !dev.mesh_shader && !(e && atoi(e) == 0);
+    }
+    logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s; mesh emulation %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
-         dev.graphics_pipeline_library ? "yes" : "no");
+         dev.graphics_pipeline_library ? "yes" : "no", g_vk_emulate_mesh_shader ? "on" : "off");
     if (!dev.mesh_shader && !getenv("RX_VK_NO_MESH_WARNING")) {
         // (the game draws its foliage, grass and many effects with mesh shaders: without them those draws are left out and the
-        // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on)
-        logf("vk: this GPU has no mesh shaders: the game's foliage, grass and many effects cannot be drawn");
+        // picture is broken (an RX 580's "static"-like scenes, 2026-11-08). Said once, on its own thread, and the game goes on.
+        // The emulation path takes their place; until its translated compute pipelines exist, the message still stands)
+        logf("vk: this GPU has no mesh shaders: the game's foliage, grass and many effects cannot be drawn%s",
+             g_vk_emulate_mesh_shader ? " (mesh emulation is on, docs/arm64-phase3.md)" : "");
 #ifdef _WIN32
         std::thread([name = std::string(dev.props.deviceName)] {
             const std::string text = "Your graphics card (" + name + ") or its driver has no mesh shader support, which Ocarina of Time "

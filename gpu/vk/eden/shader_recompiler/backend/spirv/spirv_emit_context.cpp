@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <map>
 #include <array>
 #include <bit>
@@ -21,6 +22,8 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
+
+thread_local bool g_mesh_emu = false;
 namespace {
 enum class Operation {
     Increment,
@@ -515,6 +518,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
+    mesh_emu = g_mesh_emu && (stage == Stage::Task || stage == Stage::Mesh);
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
     u32& texture_binding{is_unified ? bindings.unified : bindings.texture};
@@ -524,7 +528,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineCommonConstants();
     DefineInterfaces(program);
     // (RX_VK_MESH_FIRST=1, with RX_VK_MESH_ARGS=1: off, one task program with it hung or ended the game at its first draw)
-    if (stage == Stage::Task && getenv("RX_VK_MESH_FIRST") && profile.unified_descriptor_binding && profile.support_int64) {
+    if (stage == Stage::Task && !mesh_emu && getenv("RX_VK_MESH_FIRST") && profile.unified_descriptor_binding && profile.support_int64) {
         // (hookshot) the draw's first task workgroup, read through a pushed address (EmitIsbeRead)
         if (!Sirit::ValidId(U64)) { AddCapability(spv::Capability::Int64); U64 = Name(TypeInt(64, false), "u64"); }
         wants_mesh_first = true;
@@ -2134,10 +2138,94 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
+    if (mesh_emu) {
+        // (hookshot) No mesh shaders: the program runs as GLCompute, and its output block is the draw's ring region: the
+        // counters at 0, the indirect command at 16, positions at 64, indices after them, and the task payload last (it has
+        // to be global: the task and the mesh stage are two dispatches). Only the outputs this path can place are allowed;
+        // anything else throws rather than emitting a module that draws nothing.
+        const u32 max_vertices{(std::max)(mesh_info.max_vertices, 1U)};
+        const u32 max_primitives{(std::max)(mesh_info.max_primitives, 1U)};
+        const u32 payload_words{mesh_info.payload_words};
+        const Id position_array{TypeArray(F32[4], Const(max_vertices * 64U))};
+        const Id index_array{TypeArray(U32[3], Const(max_primitives * 64U))};
+        const Id counter_array{TypeArray(U32[1], Const(4U))};
+        const Id indirect_array{TypeArray(U32[1], Const(5U))};
+        const Id payload_array{TypeArray(U32[1], Const(payload_words))};
+        const Id block{TypeStruct(counter_array, indirect_array, position_array, index_array,
+                                  payload_array)};
+        Decorate(block, spv::Decoration::Block);
+        MemberDecorate(block, 0, spv::Decoration::Offset, 0U);
+        MemberDecorate(block, 1, spv::Decoration::Offset, 16U);
+        MemberDecorate(block, 2, spv::Decoration::Offset, 64U);
+        MemberDecorate(block, 3, spv::Decoration::Offset, 64U + max_vertices * 64U * 16U);
+        MemberDecorate(block, 4, spv::Decoration::Offset,
+                       64U + max_vertices * 64U * 16U + max_primitives * 64U * 16U);
+        Decorate(position_array, spv::Decoration::ArrayStride, 16U);
+        Decorate(index_array, spv::Decoration::ArrayStride, 16U);
+        Decorate(counter_array, spv::Decoration::ArrayStride, 4U);
+        Decorate(indirect_array, spv::Decoration::ArrayStride, 4U);
+        Decorate(payload_array, spv::Decoration::ArrayStride, 4U);
+        const Id storage{AddGlobalVariable(TypePointer(spv::StorageClass::StorageBuffer, block),
+                                          spv::StorageClass::StorageBuffer)};
+        Name(storage, "mesh_outputs");
+        Decorate(storage, spv::Decoration::DescriptorSet, 1U);
+        Decorate(storage, spv::Decoration::Binding, 0U);
+        interfaces.push_back(storage);
+        mesh_storage = storage;
+        mesh_counter_pointer = TypePointer(spv::StorageClass::StorageBuffer, counter_array);
+        mesh_out_f32 = TypePointer(spv::StorageClass::StorageBuffer, F32[1]);
+        mesh_out_u32 = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+        mesh_payload_u32 = mesh_out_u32;
+        if (stage == Stage::Task) {
+            return;   // (the task writes its payload and the mesh workgroup count into the block)
+        }
+        mesh_loop_counter =
+            DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        // (the program body writes the stage buffer in workgroup memory exactly as with hardware mesh shaders)
+        const u32 vertex_lines{static_cast<u32>(mesh_info.vertex_lines.size())};
+        const u32 primitive_lines{static_cast<u32>(mesh_info.primitive_lines.size())};
+        const u32 corners{mesh_info.Corners()};
+        mesh_primitive_base = Common::DivCeil(mesh_info.max_vertices, 32U) * vertex_lines * 32;
+        mesh_attribute_words = (std::max)(
+            mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
+            1U);
+        mesh_map_bytes = 4 + corners * mesh_info.max_primitives;
+        mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
+        mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
+                                         std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_attributes, "isbe_attributes");
+        mesh_map = DefineVariable(*this, TypeArray(U32[1], Const(mesh_map_bytes)), std::nullopt,
+                                  spv::StorageClass::Workgroup);
+        Name(mesh_map, "isbe_map");
+        mesh_primitive_count =
+            DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        Name(mesh_primitive_count, "isbe_primitive_count");
+        if (!mesh_info.primitive_lines.empty()) {
+            throw NotImplementedException("Mesh emulation: per-primitive outputs");
+        }
+        mesh_vertex_base = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        mesh_index_base = DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
+        const Id positions{storage};
+        mesh_primitive_indices = storage;
+        mesh_primitive_pointer = TypePointer(spv::StorageClass::StorageBuffer, index_array);
+        mesh_primitive_member = 3;
+        const Id position_pointer{TypePointer(spv::StorageClass::StorageBuffer, position_array)};
+        for (const u32 line : mesh_info.vertex_lines) {
+            const u32 attribute{line};
+            if (attribute < static_cast<u32>(IR::Attribute::PositionX) ||
+                attribute > static_cast<u32>(IR::Attribute::PositionW)) {
+                throw NotImplementedException("Mesh emulation: generic vertex output");
+            }
+            mesh_vertex_targets.push_back(
+                {positions, attribute - static_cast<u32>(IR::Attribute::PositionX), true, 2,
+                 position_pointer});
+        }
+        return;
+    }
+    AddExtension("SPV_EXT_mesh_shader");
+    AddCapability(spv::Capability::MeshShadingEXT);
     // The task's output region, which its mesh workgroups read as their input region.
     const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
     mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
