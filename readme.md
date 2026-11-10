@@ -37,6 +37,19 @@ Discord: https://discord.gg/DVQQJphbBf
 > need your own copy. Everything the build creates (`hookshot.exe`, the generated code, the shader caches and your
 > saves) comes from your game and stays on your PC. Never share those files.
 
+> [!NOTE]
+> **Windows ARM64 & Qualcomm Adreno Fork (`windows-arm64`)**
+>
+> This fork ports Hookshot natively to **Windows ARM64 (Snapdragon X Elite / Adreno X1-85)**:
+> - **Native ARM64 toolchain & runtime** (`aarch64-w64-mingw32` / `aarch64-pc-windows-msvc`, Win64 ARM64 `setjmp`/`longjmp`, exception context).
+> - **UMA Copy Pools** when `VK_EXT_external_memory_host` is unavailable (16 GB UMA memory clamping via `RX_VK_VRAM_MB` + `RX_VK_EVICT_RENDERED`).
+> - **Vulkan Compute Emulation for `VK_EXT_mesh_shader`** (`GLCompute` task/mesh shaders, ring buffer compaction, pass-through vertex shader + indirect indexed draw).
+> - **Qualcomm Adreno compiler workaround** (`FunnelShift32` 32-bit `SHF` lowering to prevent `VK_ERROR_UNKNOWN (-13)`).
+>
+> See [docs/arm64-status.md](docs/arm64-status.md), [docs/arm64-phase2.md](docs/arm64-phase2.md), and [docs/arm64-phase3.md](docs/arm64-phase3.md) for build instructions, technical architecture, and recommended runtime settings.
+>
+> Upstream `main` is preserved intact on the `main` branch for syncing and PRs; contributors should fork/branch from `windows-arm64`.
+
 ## Project status
 
 Experimental. Most testing so far has been around the start of the game. Players have reported on many PCs since:
